@@ -35,6 +35,8 @@ pub extern crate ecow;
 
 pub use typst_library::*;
 #[doc(inline)]
+pub use typst_pdf as pdf;
+#[doc(inline)]
 pub use typst_syntax as syntax;
 #[doc(inline)]
 pub use typst_utils as utils;
@@ -300,7 +302,17 @@ impl LibraryExt for Library {
     }
 
     fn builder() -> LibraryBuilder {
+        // The formats can be enabled/disabled using feature flags.
+        let formats = [
+            Some(typst_html::FORMAT),
+            cfg!(feature = "pdf").then_some(typst_pdf::FORMAT),
+            cfg!(feature = "svg").then_some(typst_svg::FORMAT),
+            cfg!(feature = "render").then_some(typst_render::FORMAT),
+            cfg!(feature = "bundle").then_some(typst_bundle::FORMAT),
+        ];
+
         LibraryBuilder::from_routines(&ROUTINES)
+            .with_formats(formats.into_iter().flatten())
     }
 }
 
@@ -319,7 +331,6 @@ static ROUTINES: LazyLock<Routines> = LazyLock::new(|| Routines {
     eval_closure: typst_eval::eval_closure,
     realize: typst_realize::realize,
     layout_frame: typst_layout::layout_frame,
-    html_module: typst_html::module,
     html_mathml_body: typst_html::html_mathml_body,
     html_span_filled: typst_html::html_span_filled,
 });
