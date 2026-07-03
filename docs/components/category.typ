@@ -16,11 +16,19 @@
 
 
 // Build a scope from a module and binding info.
-#let scope-from(mod, info) = (
-  mod: mod,
-  dict: dictionary(mod),
-  info: info,
-)
+#let scope-from(val, info) = {
+  let mod = if type(val) == function {
+    stdx.describe(val).scope
+  } else {
+    val
+  }
+
+  (
+    val: val,
+    dict: dictionary(mod),
+    info: info,
+  )
+}
 
 // Build the scope information for a module.
 //
@@ -33,7 +41,7 @@
 // Get nested binding information, feature gates of the parent scope info will
 // be forwarded to the nested item info.
 #let nested-binding(scope, key) = {
-  let info = stdx.binding(scope.mod, key)
+  let info = stdx.binding(scope.val, key)
   if info.feature == none {
     info.feature = scope.info.feature
   }
@@ -773,7 +781,7 @@
   let def-target = if scope == none {
     label("reference:" + category)
   } else {
-    scope.mod
+    scope.val
   }
 
   let scope = if scope != none {
@@ -789,13 +797,13 @@
       .dict
       .pairs()
       .filter(((k, v)) => (
-        stdx.binding(scope.mod, k).category == category
+        stdx.binding(scope.val, k).category == category
           and type(v) in (function, type)
           and v not in skip
           and not (
-            (scope.mod == math and k == "text") // dupe
-              or (scope.mod == pdf and k == "embed") // deprecated
-              or (scope.mod == std and k == "pattern") // deprecated
+            (scope.val == math and k == "text") // dupe
+              or (scope.val == pdf and k == "embed") // deprecated
+              or (scope.val == std and k == "pattern") // deprecated
           )
       ))
       .map(((k, v)) => (
