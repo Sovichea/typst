@@ -19,3 +19,5 @@ Thanks for the multi attention.] okay!
 This #link("https://example.com")[is another #link("https://second-example.com")[split multi paragraph link.
 
 Thanks for the] split multi attention.] goodbyes!
+
+Link #link("https://tall.com")[tall #box(width: 1em, height: 2em, fill: red, baseline: -2em)[tall]] #link("https://short.com")[short] and #link("https://box.com", box(fill: red)[tis' a box])
