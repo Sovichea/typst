@@ -5,7 +5,7 @@ use krilla::surface::Surface;
 use krilla::tagging::{Artifact, ArtifactType, ContentTag, SpanTag};
 use typst_layout::PagedDocument;
 use typst_library::diag::{SourceResult, bail};
-use typst_library::layout::{FrameParent, Point, Rect, Size};
+use typst_library::layout::{FrameParent, Point, Rect, Size, Transform};
 use typst_library::text::{Locale, TextItem};
 use typst_library::visualize::{Image, Shape};
 use typst_syntax::Span;
@@ -222,6 +222,41 @@ pub fn text<'a, 'b>(
     let content = ContentTag::Span(SpanTag::empty().with_lang(lang_str.as_deref()));
     let id = surface.start_tagged(content);
 
+    gc.tags.push_text(attrs, id);
+
+    TagHandle { surface, started: true }
+}
+
+pub fn text_batch<'a, 'b>(
+    gc: &mut GlobalContext,
+    fc: &mut FrameContext,
+    surface: &'b mut Surface<'a>,
+    fragments: &[(Point, &TextItem)],
+) -> TagHandle<'a, 'b> {
+    let Some((_, first)) = fragments.first() else {
+        return TagHandle { surface, started: false };
+    };
+    if disabled(gc) {
+        return TagHandle { surface, started: false };
+    }
+
+    for (point, text) in fragments {
+        fc.push();
+        fc.state_mut().pre_concat(Transform::translate(point.x, point.y));
+        update_bbox(gc, fc, || text.bbox());
+        fc.pop();
+    }
+
+    if gc.tags.tree.parent_artifact().is_some() {
+        return TagHandle { surface, started: false };
+    }
+
+    let attrs = tree::resolve_text_attrs(&mut gc.tags.tree, gc.options, first);
+    let locale = Locale::new(first.lang, first.region);
+    let lang = gc.tags.tree.groups.propagate_lang(gc.tags.tree.current(), locale);
+    let lang_str = lang.map(Locale::rfc_3066);
+    let content = ContentTag::Span(SpanTag::empty().with_lang(lang_str.as_deref()));
+    let id = surface.start_tagged(content);
     gc.tags.push_text(attrs, id);
 
     TagHandle { surface, started: true }

@@ -38,7 +38,7 @@ use crate::outline::build_outline;
 use crate::page::PageLabelExt;
 use crate::shape::handle_shape;
 use crate::tags::{self, GroupId, Tags};
-use crate::text::handle_text;
+use crate::text::{handle_text, handle_text_batch, prepare_text_batch};
 use crate::util::{
     AbsExt, SpotColorantFromNameExt, TransformExt, ValidatorsExt, convert_path,
     display_font,
@@ -355,7 +355,16 @@ pub(crate) fn handle_frame(
     fc.state_mut()
         .pre_concat(Transform::translate(padding.left, padding.top));
 
-    for (point, item) in frame.items() {
+    let items = frame.items().as_slice();
+    let mut item_index = 0;
+    while item_index < items.len() {
+        if let Some(batch) = prepare_text_batch(&items[item_index..]) {
+            handle_text_batch(fc, &batch, surface, gc)?;
+            item_index += batch.consumed;
+            continue;
+        }
+
+        let (point, item) = &items[item_index];
         fc.push();
         fc.state_mut().pre_concat(Transform::translate(point.x, point.y));
 
@@ -382,6 +391,7 @@ pub(crate) fn handle_frame(
         }
 
         fc.pop();
+        item_index += 1;
     }
 
     fc.pop();

@@ -1,0 +1,14 @@
+[package]
+name = "unicode-pdf-harness"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+typst = { workspace = true }
+typst-layout = { workspace = true }
+typst-pdf = { workspace = true }
+
+[lints]
+workspace = true
