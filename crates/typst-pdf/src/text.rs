@@ -3,13 +3,17 @@ use std::sync::Arc;
 
 use bytemuck::TransparentWrapper;
 use krilla::surface::{Location, Surface};
-use krilla::text::{GlyphFragment, GlyphId};
+use krilla::text::GlyphId;
 use typst_library::diag::{SourceResult, bail};
 use typst_library::layout::{FrameItem, Point};
 use typst_library::text::{FontInstance, Glyph, TextItem};
 use typst_library::visualize::{FillRule, Paint};
 use typst_syntax::Span;
 use typst_utils::defer;
+
+mod semantic;
+
+use self::semantic::{SemanticFragment, prepare_semantic_run};
 
 use crate::convert::{FrameContext, GlobalContext};
 use crate::util::{AbsExt, TransformExt, display_font};
@@ -199,22 +203,40 @@ pub(crate) fn handle_text(
     } else {
         None
     };
-    let text = t.text.as_str();
     let size = t.size;
     let glyphs: &[PdfGlyph] = TransparentWrapper::wrap_slice(t.glyphs.as_slice());
+    let fragment = SemanticFragment {
+        start: krilla::geom::Point::from_xy(0.0, 0.0),
+        glyphs,
+        text: t.text.as_str(),
+        text_offset: 0,
+    };
+    let semantic =
+        prepare_semantic_run(&[fragment], &t.font, t.text.as_str(), size.to_f32());
 
     surface.push_transform(&fc.state().transform().to_krilla());
     let mut surface = defer(surface, |s| s.pop());
     surface.set_fill(Some(fill));
     surface.set_stroke(stroke);
-    surface.draw_glyphs(
-        krilla::geom::Point::from_xy(0.0, 0.0),
-        glyphs,
-        font.clone(),
-        text,
-        size.to_f32(),
-        false,
-    );
+    if let Some(semantic) = semantic {
+        surface.draw_glyphs(
+            semantic.start,
+            &semantic.glyphs,
+            semantic.font,
+            t.text.as_str(),
+            size.to_f32(),
+            false,
+        );
+    } else {
+        surface.draw_glyphs(
+            krilla::geom::Point::from_xy(0.0, 0.0),
+            glyphs,
+            font,
+            t.text.as_str(),
+            size.to_f32(),
+            false,
+        );
+    }
 
     Ok(())
 }
@@ -249,10 +271,10 @@ pub(crate) fn handle_text_batch(
         None
     };
 
-    let fragments: Vec<GlyphFragment<'_, PdfGlyph>> = batch
+    let fragments: Vec<SemanticFragment<'_>> = batch
         .fragments
         .iter()
-        .map(|fragment| GlyphFragment {
+        .map(|fragment| SemanticFragment {
             start: krilla::geom::Point::from_xy(
                 fragment.point.x.to_f32(),
                 fragment.point.y.to_f32(),
@@ -264,18 +286,38 @@ pub(crate) fn handle_text_batch(
             text_offset: fragment.text_offset,
         })
         .collect();
+    let semantic = prepare_semantic_run(
+        &fragments,
+        &first.font,
+        &batch.logical_text,
+        first.size.to_f32(),
+    );
 
     surface.push_transform(&fc.state().transform().to_krilla());
     let mut surface = defer(surface, |s| s.pop());
     surface.set_fill(Some(fill));
     surface.set_stroke(stroke);
-    surface.draw_glyph_fragments(
-        &fragments,
-        font,
-        &batch.logical_text,
-        first.size.to_f32(),
-        false,
-    );
+    if let Some(semantic) = semantic {
+        surface.draw_glyphs(
+            semantic.start,
+            &semantic.glyphs,
+            semantic.font,
+            &batch.logical_text,
+            first.size.to_f32(),
+            false,
+        );
+    } else {
+        for fragment in fragments {
+            surface.draw_glyphs(
+                fragment.start,
+                fragment.glyphs,
+                font.clone(),
+                fragment.text,
+                first.size.to_f32(),
+                false,
+            );
+        }
+    }
     Ok(())
 }
 

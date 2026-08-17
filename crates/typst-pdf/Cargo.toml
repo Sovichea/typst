@@ -34,6 +34,7 @@ krilla-svg = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
+unicode-pdf = { workspace = true }
 
 [lints]
 workspace = true

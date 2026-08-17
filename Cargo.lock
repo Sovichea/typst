@@ -1506,6 +1506,8 @@ dependencies = [
 [[package]]
 name = "krilla"
 version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27da593198b20eeba65caeb73c2bbeec3e53ab08fa549898312ce81c4fce5e33"
 dependencies = [
  "base64",
  "bumpalo",
@@ -1527,7 +1529,6 @@ dependencies = [
  "smallvec",
  "subsetter",
  "tiny-skia-path",
- "unicode-pdf",
  "xmp-writer",
  "yoke",
  "zune-jpeg",
@@ -3470,6 +3471,7 @@ dependencies = [
  "typst-syntax",
  "typst-timing",
  "typst-utils",
+ "unicode-pdf",
 ]
 
 [[package]]
@@ -3708,18 +3710,10 @@ dependencies = [
 [[package]]
 name = "unicode-pdf"
 version = "0.1.0-alpha.3"
+source = "git+https://github.com/Sovichea/unicode-pdf.git?rev=9302de8df9bc11f764526b9d38ff0a3912bb957d#9302de8df9bc11f764526b9d38ff0a3912bb957d"
 dependencies = [
  "harfrust",
  "unicode-bidi",
-]
-
-[[package]]
-name = "unicode-pdf-harness"
-version = "0.15.1"
-dependencies = [
- "typst",
- "typst-layout",
- "typst-pdf",
 ]
 
 [[package]]
