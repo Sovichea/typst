@@ -151,7 +151,9 @@ web-sys = "0.3"
 xmlwriter = "0.1.0"
 xz2 = { version = "0.1", features = ["static"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
-unicode-pdf = { git = "https://github.com/Sovichea/unicode-pdf.git", rev = "9302de8df9bc11f764526b9d38ff0a3912bb957d" }
+
+[patch.crates-io]
+krilla = { git = "https://github.com/Sovichea/krilla.git", rev = "92cd34f2f9b7ff2d02b7d2b358d7d7a27e3c1dce" }
 
 [profile.dev.package."*"]
 opt-level = 2

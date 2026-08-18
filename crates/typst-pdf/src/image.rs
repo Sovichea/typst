@@ -212,7 +212,12 @@ fn convert_raster(
 
 #[comemo::memoize]
 fn convert_pdf(pdf: &PdfImage) -> PdfDocument {
-    PdfDocument::new(pdf.document().pdf().clone())
+    // The patched Krilla revision currently uses a newer Hayro source than
+    // Typst 0.15. Reparse the already validated bytes until both dependencies
+    // converge on the same Hayro release.
+    let data = pdf.document().pdf().data().as_ref().to_vec();
+    let pdf = krilla::pdf::Pdf::new(data).expect("failed to reload validated PDF");
+    PdfDocument::new(Arc::new(pdf))
 }
 
 fn exif_transform(image: &RasterImage, size: Size) -> (Transform, Size) {

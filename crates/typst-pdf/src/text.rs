@@ -11,9 +11,9 @@ use typst_library::visualize::{FillRule, Paint};
 use typst_syntax::Span;
 use typst_utils::defer;
 
-mod semantic;
+mod logical;
 
-use self::semantic::{SemanticFragment, prepare_semantic_run};
+use self::logical::{LogicalFragment, prepare_logical_run};
 
 use crate::convert::{FrameContext, GlobalContext};
 use crate::util::{AbsExt, TransformExt, display_font};
@@ -205,28 +205,22 @@ pub(crate) fn handle_text(
     };
     let size = t.size;
     let glyphs: &[PdfGlyph] = TransparentWrapper::wrap_slice(t.glyphs.as_slice());
-    let fragment = SemanticFragment {
+    let fragment = LogicalFragment {
         start: krilla::geom::Point::from_xy(0.0, 0.0),
         glyphs,
         text: t.text.as_str(),
         text_offset: 0,
     };
-    let semantic =
-        prepare_semantic_run(&[fragment], &t.font, t.text.as_str(), size.to_f32());
+    let logical =
+        prepare_logical_run(&[fragment], &t.font, t.text.as_str(), size.to_f32());
 
     surface.push_transform(&fc.state().transform().to_krilla());
     let mut surface = defer(surface, |s| s.pop());
     surface.set_fill(Some(fill));
     surface.set_stroke(stroke);
-    if let Some(semantic) = semantic {
-        surface.draw_glyphs(
-            semantic.start,
-            &semantic.glyphs,
-            semantic.font,
-            t.text.as_str(),
-            size.to_f32(),
-            false,
-        );
+    if let Some(logical) = logical {
+        let units = logical.units(t.text.as_str());
+        surface.draw_pdf_logical_units(logical.start, &units, font, size.to_f32(), false);
     } else {
         surface.draw_glyphs(
             krilla::geom::Point::from_xy(0.0, 0.0),
@@ -271,10 +265,10 @@ pub(crate) fn handle_text_batch(
         None
     };
 
-    let fragments: Vec<SemanticFragment<'_>> = batch
+    let fragments: Vec<LogicalFragment<'_>> = batch
         .fragments
         .iter()
-        .map(|fragment| SemanticFragment {
+        .map(|fragment| LogicalFragment {
             start: krilla::geom::Point::from_xy(
                 fragment.point.x.to_f32(),
                 fragment.point.y.to_f32(),
@@ -286,7 +280,7 @@ pub(crate) fn handle_text_batch(
             text_offset: fragment.text_offset,
         })
         .collect();
-    let semantic = prepare_semantic_run(
+    let logical = prepare_logical_run(
         &fragments,
         &first.font,
         &batch.logical_text,
@@ -297,12 +291,12 @@ pub(crate) fn handle_text_batch(
     let mut surface = defer(surface, |s| s.pop());
     surface.set_fill(Some(fill));
     surface.set_stroke(stroke);
-    if let Some(semantic) = semantic {
-        surface.draw_glyphs(
-            semantic.start,
-            &semantic.glyphs,
-            semantic.font,
-            &batch.logical_text,
+    if let Some(logical) = logical {
+        let units = logical.units(&batch.logical_text);
+        surface.draw_pdf_logical_units(
+            logical.start,
+            &units,
+            font,
             first.size.to_f32(),
             false,
         );
