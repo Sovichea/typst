@@ -33,6 +33,12 @@ struct PreparedTextFragment<'a> {
 
 /// Merge consecutive Typst text items that originate from one shaped source
 /// run but were separated for visual baseline positioning.
+///
+/// This is deliberately narrower than coalescing arbitrary nearby text. In
+/// particular, generated discretionary or repeated hyphens can share source
+/// metadata with surrounding text while carrying different Unicode semantics.
+/// Conflicting reconstruction therefore returns `None` and lets the caller use
+/// the ordinary Krilla text path instead of guessing or dropping source text.
 pub(crate) fn prepare_text_batch<'a>(
     items: &'a [(Point, FrameItem)],
 ) -> Option<PreparedTextBatch<'a>> {
@@ -124,7 +130,11 @@ fn extend_baseline_span(
 fn merge_text_segments(segments: &[(usize, &str)]) -> Option<(usize, String)> {
     let minimum = segments.iter().map(|(base, _)| *base).min()?;
     let mut ordered = segments.to_vec();
-    ordered.sort_unstable_by_key(|(base, _)| *base);
+    // Prefer the longest fragment at the same source offset. Overlay fragments
+    // then produce the same reconstruction regardless of frame-item order.
+    ordered.sort_by(|(base_a, text_a), (base_b, text_b)| {
+        base_a.cmp(base_b).then_with(|| text_b.len().cmp(&text_a.len()))
+    });
     let mut logical_text = String::new();
     for (base, text) in ordered {
         let offset = base.checked_sub(minimum)?;
@@ -219,6 +229,11 @@ pub(crate) fn handle_text(
     surface.set_fill(Some(fill));
     surface.set_stroke(stroke);
     if let Some(logical) = logical {
+        // The Unicode on each logical unit is authoritative. Krilla gives the
+        // unit its own semantic CID and synthetic TrueType glyph, then emits a
+        // normal ToUnicode mapping while the original shaped glyphs determine
+        // the visible geometry. We intentionally do not rely on ActualText for
+        // this replacement; marked content remains available for PDF tagging.
         let units = logical.units(t.text.as_str());
         surface.draw_pdf_logical_units(logical.start, &units, font, size.to_f32(), false);
     } else {
@@ -418,12 +433,37 @@ mod tests {
     }
 
     #[test]
+    fn merges_overlays_independent_of_fragment_order() {
+        let prefix = "ខ្មែរ";
+        let full = "ខ្មែរអក្សរសាស្ត្រ";
+        let (_, forward) = merge_text_segments(&[(40, prefix), (40, full)]).unwrap();
+        let (_, reverse) = merge_text_segments(&[(40, full), (40, prefix)]).unwrap();
+        assert_eq!(forward, full);
+        assert_eq!(reverse, full);
+    }
+
+    #[test]
     fn keeps_legitimate_repeated_source_text() {
         let cluster = "ខ្ញុំ";
         let (_, merged) =
             merge_text_segments(&[(100, cluster), (100 + cluster.len(), cluster)])
                 .unwrap();
         assert_eq!(merged, "ខ្ញុំខ្ញុំ");
+    }
+
+    #[test]
+    fn keeps_multiple_hyphens_at_distinct_source_offsets() {
+        let (_, merged) =
+            merge_text_segments(&[(20, "-"), (21, "-"), (22, "tail")]).unwrap();
+        assert_eq!(merged, "--tail");
+    }
+
+    #[test]
+    fn rejects_conflicting_discretionary_hyphen_semantics() {
+        // A visible hard hyphen and a soft hyphen can use the same painted
+        // glyph while representing different Unicode. Never deduplicate that
+        // conflict merely because the visual glyph is identical.
+        assert!(merge_text_segments(&[(12, "-"), (12, "\u{ad}")]).is_none());
     }
 
     #[test]
@@ -436,5 +476,13 @@ mod tests {
     fn allows_mark_offsets_but_rejects_the_next_visual_line() {
         assert_eq!(extend_baseline_span(70.0, 70.0, 75.5, 8.0), Some((70.0, 75.5)));
         assert_eq!(extend_baseline_span(70.0, 75.5, 88.0, 8.0), None);
+    }
+
+    #[test]
+    fn keeps_repeated_line_hyphens_outside_the_overlay_window() {
+        // A repeated language-specific hyphen at the next line is a separate
+        // visual line, not a baseline-shifted fragment of the preceding run.
+        assert_eq!(extend_baseline_span(42.0, 42.0, 47.0, 8.0), Some((42.0, 47.0)));
+        assert_eq!(extend_baseline_span(42.0, 47.0, 55.0, 8.0), None);
     }
 }
