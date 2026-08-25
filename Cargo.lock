@@ -1536,7 +1536,7 @@ dependencies = [
 [[package]]
 name = "krilla"
 version = "0.8.2"
-source = "git+https://github.com/Sovichea/krilla.git?rev=92cd34f2f9b7ff2d02b7d2b358d7d7a27e3c1dce#92cd34f2f9b7ff2d02b7d2b358d7d7a27e3c1dce"
+source = "git+https://github.com/Sovichea/krilla.git?rev=0cf4da659c6bae966fcec71e26d6d937185c95c9#0cf4da659c6bae966fcec71e26d6d937185c95c9"
 dependencies = [
  "base64",
  "bumpalo",
