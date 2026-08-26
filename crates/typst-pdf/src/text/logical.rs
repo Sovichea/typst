@@ -88,6 +88,12 @@ pub(super) fn prepare_logical_run(
     }
 
     let anchor = fragments.first()?.start;
+    // TrueType composite glyph offsets are stored as i16. A logical unit whose
+    // visual width would push a component offset past that range cannot be
+    // synthesized, so fall back to ordinary glyph drawing for such runs (e.g.
+    // repeated-dot outline leaders). Leave a two-em margin so the synthesized
+    // composite bbox and component offsets stay within the i16 range.
+    let max_logical_width = i16::MAX as f32 / source_font.units_per_em() as f32 - 2.0;
     let mut grouped = BTreeMap::<(usize, usize), Vec<PositionedGlyph>>::new();
 
     for fragment in fragments {
@@ -142,7 +148,7 @@ pub(super) fn prepare_logical_run(
         if cursor < start {
             units.push(empty_unit(cursor..start));
         }
-        units.push(positioned_unit(start..end, glyphs)?);
+        units.push(positioned_unit(start..end, glyphs, max_logical_width)?);
         cursor = end;
     }
     if cursor < text.len() {
@@ -165,6 +171,7 @@ fn empty_unit(range: Range<usize>) -> OwnedLogicalUnit {
 fn positioned_unit(
     range: Range<usize>,
     positioned: Vec<PositionedGlyph>,
+    max_width: f32,
 ) -> Option<OwnedLogicalUnit> {
     let origin_x = positioned
         .iter()
@@ -175,7 +182,7 @@ fn positioned_unit(
         .flat_map(|glyph| [glyph.run_x, glyph.run_x + glyph.x_advance])
         .reduce(f32::max)?;
     let width = end_x - origin_x;
-    if !origin_x.is_finite() || !width.is_finite() || width < 0.0 {
+    if !origin_x.is_finite() || !width.is_finite() || width < 0.0 || width > max_width {
         return None;
     }
 
