@@ -153,7 +153,7 @@ xz2 = { version = "0.1", features = ["static"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [patch.crates-io]
-krilla = { git = "https://github.com/Sovichea/krilla.git", rev = "94d3481150014659ff181fdb9c1163d1d17a40f5" }
+krilla = { git = "https://github.com/Sovichea/krilla.git", rev = "d05158cf3ebead248745f846d0397e84dfb9f2d0" }
 
 [profile.dev.package."*"]
 opt-level = 2
