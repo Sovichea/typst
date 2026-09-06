@@ -48,9 +48,49 @@ Conflicting, non-contiguous, or ambiguous layouts continue through the ordinary 
 
 The unit tests model the reported leading-space plus Khmer layout directly and verify that a source delta of -1 becomes a one-byte logical prefix shift. A second test verifies that foreign text appearing after the prefix is rejected. Existing tests continue to cover overlapping Khmer fragments, legitimate repeated text, conflicting overlaps, and line-boundary protection.
 
-The end-to-end reproducer should retain both Khmer-label and Latin-label forms because the bold label content is not part of the trigger:
+The end-to-end reproducer retains both Khmer-label and Latin-label forms because the bold label content is not part of the trigger. It also includes legitimately repeated text as a false-positive control:
 
     #strong[ផ្នែក ក] ក្រសួងប្រៃសណីយ៍។
     #strong[Label] ការគ្រប់គ្រងគម្រោង។
+    #strong[Control] ពាក្យដដែល ពាក្យដដែល។
 
 Validation should compare extracted UTF-8 bytes and inspect the regular-font ToUnicode CMap. Each source cluster must have one semantic CID even when several visual glyph components contribute to it.
+
+## End-to-end validation
+
+The regression was reproduced with the static Regular and Bold TTF faces from
+the official Noto Sans Khmer v2.004 release. System fonts were disabled during
+compilation so both builds used the same font files.
+
+Font SHA-256 hashes:
+
+- `NotoSansKhmer-Regular.ttf`: `CC8AF91F5558AC8E53FCE83213328DADA31B22EDB562E44938F04238A2A65B6A`
+- `NotoSansKhmer-Bold.ttf`: `4CF9803A479D68CB637FA8094FDF7BBD6B63EA546856E406E435101C12A6B24D`
+
+The parent build at `821bf1bf6` reproduced both reported failures:
+
+- `ក្រសួង` extracted as `ក្រសួសួង`
+- `គ្រប់គ្រង` extracted as `គ្រប់ប់គ្រង`
+
+The fixed build at `08e0d58b7` matched the authored UTF-8 text exactly in
+Poppler, PDFium, and pypdf. PDFium search also changed as expected:
+
+| Search text | Parent | Fixed | Expected |
+|---|---:|---:|---:|
+| `ក្រសួង` | 0 | 1 | 1 |
+| `គ្រប់គ្រង` | 0 | 2 | 2 |
+| `ពាក្យដដែល` | 2 | 2 | 2 |
+
+The unchanged control count verifies that batching removes overlapping
+semantic ownership without deduplicating equal text at distinct source
+positions.
+
+`qpdf --check` reported no syntax or stream-encoding errors for the parent,
+fixed, or standards-enabled files. The fixed document also compiled with
+combined PDF/A-2b and PDF/UA-1 settings, and veraPDF passed both profiles.
+
+Visual inspection at 144 DPI found no layout, clipping, overlap, or legibility
+regression. The raster images were not byte-identical because the repaired
+words use different logical text grouping. Differences were confined to
+antialiased glyph edges: 2,217 of 447,198 pixels (`0.4958%`), with a mean
+absolute grayscale error of `0.097248` on a 0-255 scale.
