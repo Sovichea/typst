@@ -47,7 +47,23 @@ pub(crate) fn prepare_text_batch<'a>(
     {
         return None;
     }
-    let (source_span, first_base) = text_source_base(first)?;
+    let (source_span, first_base, source_shift) =
+        if let Some((span, base)) = text_source_base(first) {
+            (span, base, 0)
+        } else {
+            // A style boundary can leave an unrelated separator at the start of
+            // the first item. Find the source coordinates shared with the first
+            // visual overlay and shift them past that authoritative prefix.
+            let (_, FrameItem::Text(next)) = items.get(1)? else {
+                return None;
+            };
+            if !compatible_text(first, next) {
+                return None;
+            }
+            let (span, _) = text_source_base(next)?;
+            let shift = mixed_source_prefix_shift(&first.text, &first.glyphs, span)?;
+            (span, 0, shift)
+        };
     let mut candidates = vec![(*first_point, first, first_base)];
     let mut minimum_baseline = first_point.y.to_f32();
     let mut maximum_baseline = minimum_baseline;
@@ -57,16 +73,13 @@ pub(crate) fn prepare_text_batch<'a>(
         let FrameItem::Text(text) = item else {
             break;
         };
-        if text.font != first.font
-            || text.size != first.size
-            || text.fill != first.fill
-            || text.stroke != first.stroke
-            || text.lang != first.lang
-            || text.region != first.region
-        {
+        if !compatible_text(first, text) {
             break;
         }
         let Some((span, base)) = text_source_base(text) else {
+            break;
+        };
+        let Some(base) = base.checked_add(source_shift) else {
             break;
         };
         if span != source_span {
@@ -144,6 +157,59 @@ fn merge_text_segments(segments: &[(usize, &str)]) -> Option<(usize, String)> {
         }
     }
     Some((minimum, logical_text))
+}
+
+fn compatible_text(first: &TextItem, text: &TextItem) -> bool {
+    text.font == first.font
+        && text.size == first.size
+        && text.fill == first.fill
+        && text.stroke == first.stroke
+        && text.lang == first.lang
+        && text.region == first.region
+}
+
+/// Return the length of a foreign prefix before glyphs from `source_span`.
+///
+/// Source positions are relative to their own span and can therefore precede
+/// local item positions. Keep that affine delta signed until it has been
+/// validated as an exact prefix shift.
+fn mixed_source_prefix_shift(
+    text: &str,
+    glyphs: &[Glyph],
+    source_span: Span,
+) -> Option<usize> {
+    let mut shared = glyphs.iter().filter(|glyph| glyph.span.0 == source_span);
+    let first = shared.next()?;
+    let delta = i32::from(first.span.1) - i32::from(first.range.start);
+    let shift = usize::try_from(delta.checked_neg()?).ok()?;
+    if shift == 0 || shift >= text.len() || !text.is_char_boundary(shift) {
+        return None;
+    }
+
+    let mut shared_start = usize::MAX;
+    for glyph in glyphs {
+        let range = glyph.range();
+        if range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            return None;
+        }
+        if glyph.span.0 == source_span {
+            if i32::from(glyph.span.1) - i32::from(glyph.range.start) != delta
+                || range.start < shift
+            {
+                return None;
+            }
+            shared_start = shared_start.min(range.start);
+        } else if range.end > shift {
+            // Only a contiguous foreign prefix is safe to preserve as part of
+            // the authoritative first fragment.
+            return None;
+        }
+    }
+
+    (shared_start == shift).then_some(shift)
 }
 
 fn text_source_base(text: &TextItem) -> Option<(Span, usize)> {
@@ -405,7 +471,25 @@ impl krilla::text::Glyph for PdfGlyph {
 
 #[cfg(test)]
 mod tests {
-    use super::{extend_baseline_span, merge_text_segments};
+    use std::num::NonZeroU64;
+
+    use typst_library::layout::Em;
+    use typst_library::text::Glyph;
+    use typst_syntax::Span;
+
+    use super::{extend_baseline_span, merge_text_segments, mixed_source_prefix_shift};
+
+    fn glyph(span: Span, source: u16, range: std::ops::Range<u16>) -> Glyph {
+        Glyph {
+            id: 0,
+            x_advance: Em::zero(),
+            x_offset: Em::zero(),
+            y_advance: Em::zero(),
+            y_offset: Em::zero(),
+            range,
+            span: (span, source),
+        }
+    }
 
     #[test]
     fn merges_overlapping_visual_fragments_once() {
@@ -430,6 +514,38 @@ mod tests {
     fn rejects_gaps_or_conflicting_overlaps() {
         assert!(merge_text_segments(&[(0, "ab"), (3, "c")]).is_none());
         assert!(merge_text_segments(&[(0, "ab"), (1, "x")]).is_none());
+    }
+
+    #[test]
+    fn normalizes_a_foreign_prefix_before_shared_source_text() {
+        let foreign = Span::from_raw(NonZeroU64::new(1).unwrap());
+        let shared = Span::from_raw(NonZeroU64::new(2).unwrap());
+        let text = " ក្រសួ";
+        let glyphs = vec![
+            glyph(foreign, 0, 0..1),
+            glyph(shared, 0, 1..10),
+            glyph(shared, 9, 10..16),
+        ];
+
+        let shift = mixed_source_prefix_shift(text, &glyphs, shared).unwrap();
+        let (_, merged) = merge_text_segments(&[(0, text), (9 + shift, "សួង")]).unwrap();
+
+        assert_eq!(shift, 1);
+        assert_eq!(merged, " ក្រសួង");
+    }
+
+    #[test]
+    fn rejects_foreign_text_after_the_prefix() {
+        let foreign = Span::from_raw(NonZeroU64::new(1).unwrap());
+        let shared = Span::from_raw(NonZeroU64::new(2).unwrap());
+        let text = " ក្រ x";
+        let glyphs = vec![
+            glyph(foreign, 0, 0..1),
+            glyph(shared, 0, 1..10),
+            glyph(foreign, 1, 10..12),
+        ];
+
+        assert_eq!(mixed_source_prefix_shift(text, &glyphs, shared), None);
     }
 
     #[test]
