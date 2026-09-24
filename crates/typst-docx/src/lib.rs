@@ -409,6 +409,10 @@ struct Emitter<'a> {
     is_region: bool,
     /// The measured gap before the region's first rule, in twips.
     rule_before: i64,
+    /// The representative typography of the paragraph being emitted, used as a
+    /// fallback for runs that don't match a layout run (e.g. a footer page
+    /// number).
+    current_typo: Option<Typography>,
     /// Placed images, for sizing an `<img>` (in document order).
     layout_images: Vec<layout::ImageInfo>,
     /// Next unconsumed layout image.
@@ -453,6 +457,7 @@ impl Emitter<'_> {
             is_footer,
             is_region,
             rule_before,
+            current_typo: None,
             layout_images,
             image_cursor: 0,
             images: Vec::new(),
@@ -585,6 +590,7 @@ impl Emitter<'_> {
 
     fn paragraph(&mut self, style: &str, runs: &[Run], num: Option<(u32, u32)>) {
         let typos = self.measure_runs(runs);
+        self.current_typo = typos.iter().flatten().next().cloned();
         self.flush_rules();
         self.record_sample(style, &typos);
         self.blocks.push(Block {
@@ -745,6 +751,7 @@ impl Emitter<'_> {
         if self.is_footer {
             let text = run.text.trim();
             if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+                let typo = typo.or(self.current_typo.as_ref());
                 let mut rpr = String::new();
                 if let Some(typo) = typo {
                     let size = (typo.size_pt * 2.0).round().max(2.0) as i64;
