@@ -1008,9 +1008,16 @@ impl Emitter<'_> {
         }
         let gap_half = gap / 2;
         let total: i64 = widths.iter().sum();
+        // A `grid` is borderless (unlike a `table`), so only style tables.
+        let borderless = el.attrs.get(attr::class).map(|c| c.as_str()) == Some("grid");
+        let tbl_style = if borderless {
+            ""
+        } else {
+            "<w:tblStyle w:val=\"TableGrid\"/>"
+        };
 
         self.out.push_str(&format!(
-            "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/>\
+            "<w:tbl><w:tblPr>{tbl_style}\
              <w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
              <w:tblLayout w:type=\"fixed\"/><w:tblCellMar>\
              <w:left w:w=\"{gap_half}\" w:type=\"dxa\"/>\

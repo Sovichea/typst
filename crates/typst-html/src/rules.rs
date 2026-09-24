@@ -623,17 +623,23 @@ const CSL_INDENT_RULE: ShowFn<CslIndentElem> = |elem, _, _| {
 
 const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span()))
+    Ok(show_cellgrid(grid, styles, elem.span(), false))
 };
 
 /// A `grid` has the same resolved cell structure as a `table`, so it exports as
-/// a `<table>` too (previously it was dropped entirely).
+/// a `<table>` too (previously it was dropped entirely). It is marked so a
+/// downstream consumer knows it has no borders (unlike a `table`).
 const GRID_RULE: ShowFn<GridElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span()))
+    Ok(show_cellgrid(grid, styles, elem.span(), true))
 };
 
-fn show_cellgrid(grid: &CellGrid, styles: StyleChain, span: Span) -> Content {
+fn show_cellgrid(
+    grid: &CellGrid,
+    styles: StyleChain,
+    span: Span,
+    borderless: bool,
+) -> Content {
     let elem = |tag, body| HtmlElem::new(tag).with_body(Some(body)).pack().spanned(span);
     let mut rows: Vec<_> = grid.entries.chunks(grid.non_gutter_column_count()).collect();
 
@@ -736,6 +742,7 @@ fn show_cellgrid(grid: &CellGrid, styles: StyleChain, span: Span) -> Content {
     };
 
     let mut attrs = HtmlAttrs::new();
+    attrs.push(attr::class, if borderless { "grid" } else { "table" });
     let mut style = eco_format!("grid-template-columns: {}", tracks.join(" "));
     if let Some(gutter) = gutter {
         style.push_str(&eco_format!("; column-gap: {gutter}"));
