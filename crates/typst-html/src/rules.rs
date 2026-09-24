@@ -14,7 +14,7 @@ use typst_library::foundations::{
 use typst_library::layout::resolve::{Cell, CellGrid, Entry, Header};
 use typst_library::layout::{
     AlignElem, Alignment, BlockElem, Celled, GridCell, GridElem, HAlignment, HElem, Length,
-    OuterVAlignment, PagebreakElem, Sizing,
+    OuterVAlignment, PagebreakElem, Rel, Sides, Sizing,
 };
 use typst_library::math::EquationElem;
 use typst_library::math::ir::resolve_equation;
@@ -623,7 +623,7 @@ const CSL_INDENT_RULE: ShowFn<CslIndentElem> = |elem, _, _| {
 
 const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span(), false, &elem.align.get_cloned(styles)))
+    Ok(show_cellgrid(grid, styles, elem.span(), false, &elem.align.get_cloned(styles), &elem.inset.get_cloned(styles)))
 };
 
 /// A `grid` has the same resolved cell structure as a `table`, so it exports as
@@ -631,8 +631,31 @@ const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
 /// downstream consumer knows it has no borders (unlike a `table`).
 const GRID_RULE: ShowFn<GridElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span(), true, &elem.align.get_cloned(styles)))
+    Ok(show_cellgrid(grid, styles, elem.span(), true, &elem.align.get_cloned(styles), &elem.inset.get_cloned(styles)))
 };
+
+/// A cell column's inset as a CSS `padding` value (`T R B L`).
+fn column_padding(
+    inset: &Celled<Sides<Option<Rel<Length>>>>,
+    column: usize,
+) -> String {
+    let value = match inset {
+        Celled::Value(value) => value.clone(),
+        Celled::Array(array) if !array.is_empty() => array[column % array.len()].clone(),
+        _ => Sides::splat(None),
+    };
+    let side = |side: Option<Rel<Length>>| {
+        side.map(|rel| rel.relative_to(Length::zero()).abs.to_pt())
+            .unwrap_or(0.0)
+    };
+    format!(
+        "{}pt {}pt {}pt {}pt",
+        side(value.top),
+        side(value.right),
+        side(value.bottom),
+        side(value.left)
+    )
+}
 
 /// A cell column's horizontal alignment as a CSS `text-align` value.
 fn column_align(align: &Celled<Smart<Alignment>>, column: usize) -> &'static str {
@@ -658,6 +681,7 @@ fn show_cellgrid(
     span: Span,
     borderless: bool,
     align: &Celled<Smart<Alignment>>,
+    inset: &Celled<Sides<Option<Rel<Length>>>>,
 ) -> Content {
     let elem = |tag, body| HtmlElem::new(tag).with_body(Some(body)).pack().spanned(span);
     let mut rows: Vec<_> = grid.entries.chunks(grid.non_gutter_column_count()).collect();
@@ -667,7 +691,13 @@ fn show_cellgrid(
         let mut cells = Vec::new();
         for entry in row {
             let Some(cell) = entry.as_cell() else { continue };
-            cells.push(show_cell(tag, cell, styles, column_align(align, column)));
+            cells.push(show_cell(
+                tag,
+                cell,
+                styles,
+                column_align(align, column),
+                &column_padding(inset, column),
+            ));
             column += cell.colspan.get();
         }
         elem(tag::tr, Content::sequence(cells))
@@ -796,12 +826,25 @@ fn sizing_css(sizing: Sizing) -> String {
     }
 }
 
-fn show_cell(tag: HtmlTag, cell: &Cell, styles: StyleChain, align: &str) -> Content {
+fn show_cell(
+    tag: HtmlTag,
+    cell: &Cell,
+    styles: StyleChain,
+    align: &str,
+    padding: &str,
+) -> Content {
     let body = cell.body.clone();
     let span = |n: NonZeroUsize| (n != NonZeroUsize::MIN).then(|| n.to_string());
     let mut attrs = HtmlAttrs::new();
+    let mut style = String::new();
     if !align.is_empty() {
-        attrs.push(attr::style, eco_format!("text-align: {align}"));
+        style.push_str(&eco_format!("text-align: {align}; "));
+    }
+    if !padding.is_empty() {
+        style.push_str(&eco_format!("padding: {padding}"));
+    }
+    if !style.is_empty() {
+        attrs.push(attr::style, style);
     }
 
     let (content, source) = if let Some(table) = body.to_packed::<TableCell>() {

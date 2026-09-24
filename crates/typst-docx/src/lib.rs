@@ -1128,6 +1128,14 @@ impl Emitter<'_> {
                 if let Some(align) = parse_text_align(cell_style) {
                     self.align = Some(align);
                 }
+                if let Some((top, right, bottom, left)) = parse_padding(cell_style) {
+                    self.out.push_str(&format!(
+                        "<w:tcMar><w:top w:w=\"{top}\" w:type=\"dxa\"/>\
+                         <w:left w:w=\"{left}\" w:type=\"dxa\"/>\
+                         <w:bottom w:w=\"{bottom}\" w:type=\"dxa\"/>\
+                         <w:right w:w=\"{right}\" w:type=\"dxa\"/></w:tcMar>"
+                    ));
+                }
                 let runs = inline(&c.children, false, false, false, None);
                 // Cells always contain at least one paragraph.
                 if runs.is_empty() {
@@ -1466,6 +1474,30 @@ fn parse_hr_style(style: &str) -> (f64, String) {
         }
     }
     (thickness, color)
+}
+
+/// Parse a CSS `padding` declaration (`T R B L` in pt) into twips.
+fn parse_padding(style: &str) -> Option<(i64, i64, i64, i64)> {
+    for declaration in style.split(';') {
+        if let Some(value) = declaration.trim().strip_prefix("padding:") {
+            let parts: Vec<f64> = value
+                .split_whitespace()
+                .filter_map(|part| {
+                    part.strip_suffix("pt").and_then(|n| n.trim().parse().ok())
+                })
+                .collect();
+            if parts.len() == 4 {
+                let twips = |pt: f64| (pt * 20.0).round() as i64;
+                return Some((
+                    twips(parts[0]),
+                    twips(parts[1]),
+                    twips(parts[2]),
+                    twips(parts[3]),
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Map a CSS `text-align` declaration to a Word `w:jc` value.
