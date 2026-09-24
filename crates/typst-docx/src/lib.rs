@@ -47,8 +47,8 @@ pub fn docx(
         .cloned()
         .collect();
 
-    let all_images = layout.map(layout::collect_images).unwrap_or_default();
-    let body_images: Vec<layout::ImageInfo> = all_images
+    let rules = layout.map(layout::collect_rules).unwrap_or_default();
+    let all_images = layout.map(layout::collect_images).unwrap_or_default();    let body_images: Vec<layout::ImageInfo> = all_images
         .iter()
         .filter(|image| image.region == layout::PageRegion::Body)
         .cloned()
@@ -73,7 +73,15 @@ pub fn docx(
         .unwrap_or((0.0, 450.0));
     let content_width_pt = content_right - content_left;
 
-    let mut em = Emitter::new(&body_runs, content_width_pt, false, body_images, collect_footnotes(document.root()));
+    let mut em = Emitter::new(
+        &body_runs,
+        content_width_pt,
+        false,
+        false,
+        body_images,
+        collect_footnotes(document.root()),
+        0,
+    );
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
             em.block(child);
@@ -93,6 +101,7 @@ pub fn docx(
         &header_runs,
         content_width_pt,
         header_images,
+        region_rule_before(&header_runs, &rules, layout::PageRegion::Header),
     );
     let footer = region_from_html(
         document.root(),
@@ -100,6 +109,7 @@ pub fn docx(
         &footer_runs,
         content_width_pt,
         footer_images,
+        region_rule_before(&footer_runs, &rules, layout::PageRegion::Footer),
     );
     let (header_dist, footer_dist) = header_footer_distances(&all, layout);
 
@@ -138,10 +148,11 @@ fn region_from_html(
     runs: &[layout::Run],
     content_width_pt: f64,
     images: Vec<layout::ImageInfo>,
+    rule_before: i64,
 ) -> Option<String> {
     let el = find_element(root, tag_name)?;
     let is_footer = tag_name == tag::footer;
-    let mut em = Emitter::new(runs, content_width_pt, is_footer, images, Vec::new());
+    let mut em = Emitter::new(runs, content_width_pt, true, is_footer, images, Vec::new(), rule_before);
     for child in &el.children {
         em.block(child);
     }
@@ -241,6 +252,31 @@ fn footnote_run(run: &Run) -> String {
         escape_xml(&run.text)
     ));
     out
+}
+
+/// The measured gap before a region's first rule, in twips.
+fn region_rule_before(
+    runs: &[layout::Run],
+    rules: &[layout::Rule],
+    region: layout::PageRegion,
+) -> i64 {
+    let Some(rule) = rules
+        .iter()
+        .find(|rule| rule.region == region && rule.page == 1)
+    else {
+        return 0;
+    };
+    let top = rule.y_pt - rule.thickness_pt / 2.0;
+    let bottom = runs
+        .iter()
+        .filter(|run| run.region == region)
+        .map(|run| run.y_pt + run.descent_pt)
+        .fold(f64::MIN, f64::max);
+    if bottom.is_finite() {
+        ((top - bottom).max(0.0) * 20.0).round() as i64
+    } else {
+        0
+    }
 }
 
 /// Find the first descendant element with the given tag.
@@ -368,6 +404,11 @@ struct Emitter<'a> {
     /// Whether this emitter is building a footer (so a digits-only run becomes
     /// a `PAGE` field).
     is_footer: bool,
+    /// Whether this emitter is building a header/footer part, whose paragraphs
+    /// must not inherit the body's `Normal` spacing.
+    is_region: bool,
+    /// The measured gap before the region's first rule, in twips.
+    rule_before: i64,
     /// Placed images, for sizing an `<img>` (in document order).
     layout_images: Vec<layout::ImageInfo>,
     /// Next unconsumed layout image.
@@ -389,9 +430,11 @@ impl Emitter<'_> {
     fn new(
         runs: &[layout::Run],
         content_width_pt: f64,
+        is_region: bool,
         is_footer: bool,
         layout_images: Vec<layout::ImageInfo>,
         footnotes: Vec<Footnote>,
+        rule_before: i64,
     ) -> Emitter<'_> {
         Emitter {
             out: String::new(),
@@ -408,6 +451,8 @@ impl Emitter<'_> {
             last_y: 0.0,
             content_width_pt,
             is_footer,
+            is_region,
+            rule_before,
             layout_images,
             image_cursor: 0,
             images: Vec::new(),
@@ -512,7 +557,8 @@ impl Emitter<'_> {
         } else if t == tag::hr {
             let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
             let (thickness, color) = parse_hr_style(style);
-            self.out.push_str(&rule_paragraph(thickness, &color, 0));
+            self.out
+                .push_str(&rule_paragraph(thickness, &color, self.rule_before));
         } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("pagebreak") {
             self.out
                 .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
@@ -548,6 +594,20 @@ impl Emitter<'_> {
         self.out.push_str("<w:p><w:pPr>");
         self.out
             .push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
+        if self.is_region {
+            // Header/footer paragraphs must not inherit the body's Normal
+            // spacing; use the text's own line height.
+            let size = typos
+                .iter()
+                .flatten()
+                .map(|typo| typo.size_pt)
+                .fold(0.0_f64, f64::max);
+            let line = ((size * 1.2).max(1.0) * 20.0).round() as i64;
+            self.out.push_str(&format!(
+                "<w:spacing w:before=\"0\" w:after=\"0\" w:line=\"{line}\" \
+                 w:lineRule=\"exact\"/>"
+            ));
+        }
         if let Some((num_id, ilvl)) = num {
             self.out.push_str(&format!(
                 "<w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/></w:numPr>"
