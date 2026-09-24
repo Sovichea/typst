@@ -84,9 +84,10 @@ impl Emitter {
 
     fn block_el(&mut self, el: &HtmlElement) {
         let t = el.tag;
-        // Typst's HTML export reserves <h1> for the document title and offsets
-        // section headings by one (`=` -> <h2>, `==` -> <h3>, ...). Map back to
-        // Word's Heading 1..4 so the outline is correct.
+        // Typst's HTML export reserves <h1> for the document title (`#set
+        // document(title: ...)`) and offsets section headings by one, so `=` ->
+        // <h2>, `==` -> <h3>, ... Map `=` -> Heading 1, `==` -> Heading 2, ...
+        // (and the document title -> Title).
         if t == tag::h1 {
             let runs = inline(&el.children, false, false, false);
             self.paragraph("Title", &runs, None);
