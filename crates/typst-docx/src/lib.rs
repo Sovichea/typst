@@ -37,13 +37,10 @@ pub fn docx(
         .collect();
 
     let rules = layout.map(layout::collect_rules).unwrap_or_default();
-    let mut body_rules: Vec<layout::Rule> = rules
-        .iter()
-        .filter(|rule| rule.region == layout::PageRegion::Body)
-        .cloned()
-        .collect();
-    body_rules
-        .sort_by(|a, b| a.y_pt.partial_cmp(&b.y_pt).unwrap_or(std::cmp::Ordering::Equal));
+    // NOTE: body rules are intentionally not emitted from the layout: it cannot
+    // distinguish a standalone `#line` from a table border or a footnote
+    // separator. Body lines should come from the HTML export instead.
+    let body_rules: Vec<layout::Rule> = Vec::new();
 
     let mut em = Emitter {
         out: String::new(),
