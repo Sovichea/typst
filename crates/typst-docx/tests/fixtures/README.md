@@ -94,5 +94,11 @@ The HTML export drops headers/footers entirely (the page set rule is ignored), s
 their content and spacing are recovered from the **layout oracle**: runs in the
 top/bottom margin become `word/header1.xml` / `word/footer1.xml`, referenced from
 `sectPr`, and repeat on every page. A trailing page number becomes a `PAGE` field.
+
+Each header/footer line gets an **exact** line height from the glyph metrics
+(`w:line` + `lineRule="exact"`), so it doesn't inherit the body's line pitch and
+pad below the baseline. Runs that sit apart on a line (e.g. a left/right grid in a
+header) are separated by a right-aligned tab stop.
+
 Not yet emitted from a header: the `#line` divider (a shape) and images.
 

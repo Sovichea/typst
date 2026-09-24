@@ -61,8 +61,16 @@ pub fn docx(
     let mut measured = finalize_measurements(&em.style_samples);
     compute_spacing(&body_runs, &mut measured, &em.blocks, margin_left);
 
-    let header = region_part(&all, layout::PageRegion::Header, "w:hdr");
-    let footer = region_part(&all, layout::PageRegion::Footer, "w:ftr");
+    let content_width = layout
+        .and_then(|doc| doc.pages().first())
+        .map(|page| {
+            let width = page.frame.size().x - page.margin.left - page.margin.right;
+            (width.to_pt() * 20.0).round() as i64
+        })
+        .unwrap_or(9000);
+
+    let header = region_part(&all, layout::PageRegion::Header, "w:hdr", content_width);
+    let footer = region_part(&all, layout::PageRegion::Footer, "w:ftr", content_width);
 
     let document_xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -865,6 +873,7 @@ fn region_part(
     runs: &[layout::Run],
     region: layout::PageRegion,
     root: &str,
+    content_width: i64,
 ) -> Option<String> {
     let mut lines: Vec<&layout::Run> = runs
         .iter()
@@ -902,10 +911,26 @@ fn region_part(
             None => 0,
         };
 
+        // An exact line height from the glyph metrics: otherwise the paragraph
+        // inherits the body's line pitch and pads below the baseline.
+        let height = group
+            .iter()
+            .map(|run| run.ascent_pt + run.descent_pt)
+            .fold(0.0_f64, f64::max);
+        let line = ((height + 1.0) * 20.0).round() as i64;
+
         body.push_str(&format!(
-            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"{after}\"/></w:pPr>"
+            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"{after}\" w:line=\"{line}\" \
+             w:lineRule=\"exact\"/><w:tabs><w:tab w:val=\"right\" w:pos=\"{content_width}\"/>\
+             </w:tabs></w:pPr>"
         ));
-        for run in group {
+        for (i, run) in group.iter().enumerate() {
+            if i > 0 {
+                let previous = group[i - 1];
+                if run.x_pt - (previous.x_pt + previous.width_pt) > 6.0 {
+                    body.push_str("<w:r><w:tab/></w:r>");
+                }
+            }
             body.push_str(&format_run(run));
         }
         body.push_str("</w:p>");

@@ -45,6 +45,8 @@ pub struct Run {
     pub span: Option<Range<usize>>,
     /// The horizontal position of the run's origin, in points.
     pub x_pt: f64,
+    /// The width of the run's text, in points.
+    pub width_pt: f64,
     /// The vertical position of the run's baseline, in points.
     pub y_pt: f64,
     /// The 1-based page number the run appears on.
@@ -155,6 +157,7 @@ fn run_of(text: &TextItem, world: Option<&dyn World>) -> Run {
         },
         span: world.and_then(|w| text.glyphs.first().and_then(|g| w.range(g.span.0))),
         x_pt: 0.0,
+        width_pt: text.width().to_pt(),
         y_pt: 0.0,
         page: 0,
         region: PageRegion::Body,
