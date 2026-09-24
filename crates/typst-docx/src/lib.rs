@@ -1123,6 +1123,11 @@ impl Emitter<'_> {
                     .push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/></w:tcPr>"));
                 // `table.header` marks the header row for repetition, it does
                 // not style it, so header cells stay plain like Typst's.
+                let cell_style = c.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
+                let previous = self.align.clone();
+                if let Some(align) = parse_text_align(cell_style) {
+                    self.align = Some(align);
+                }
                 let runs = inline(&c.children, false, false, false, None);
                 // Cells always contain at least one paragraph.
                 if runs.is_empty() {
@@ -1130,6 +1135,7 @@ impl Emitter<'_> {
                 } else {
                     self.paragraph("Normal", &runs, None);
                 }
+                self.align = previous;
                 self.out.push_str("</w:tc>");
             }
             for index in cells..cols {

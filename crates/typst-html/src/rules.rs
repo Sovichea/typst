@@ -13,8 +13,8 @@ use typst_library::foundations::{
 };
 use typst_library::layout::resolve::{Cell, CellGrid, Entry, Header};
 use typst_library::layout::{
-    AlignElem, BlockElem, GridCell, GridElem, HAlignment, HElem, Length, OuterVAlignment,
-    PagebreakElem, Sizing,
+    AlignElem, Alignment, BlockElem, Celled, GridCell, GridElem, HAlignment, HElem, Length,
+    OuterVAlignment, PagebreakElem, Sizing,
 };
 use typst_library::math::EquationElem;
 use typst_library::math::ir::resolve_equation;
@@ -623,7 +623,7 @@ const CSL_INDENT_RULE: ShowFn<CslIndentElem> = |elem, _, _| {
 
 const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span(), false))
+    Ok(show_cellgrid(grid, styles, elem.span(), false, &elem.align.get_cloned(styles)))
 };
 
 /// A `grid` has the same resolved cell structure as a `table`, so it exports as
@@ -631,24 +631,46 @@ const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
 /// downstream consumer knows it has no borders (unlike a `table`).
 const GRID_RULE: ShowFn<GridElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span(), true))
+    Ok(show_cellgrid(grid, styles, elem.span(), true, &elem.align.get_cloned(styles)))
 };
+
+/// A cell column's horizontal alignment as a CSS `text-align` value.
+fn column_align(align: &Celled<Smart<Alignment>>, column: usize) -> &'static str {
+    let value = match align {
+        Celled::Value(value) => value.clone(),
+        Celled::Array(array) if !array.is_empty() => array[column % array.len()].clone(),
+        _ => Smart::Auto,
+    };
+    match value {
+        Smart::Custom(alignment) => match alignment.x() {
+            Some(HAlignment::Center) => "center",
+            Some(HAlignment::Right) | Some(HAlignment::End) => "right",
+            Some(HAlignment::Left) | Some(HAlignment::Start) => "left",
+            None => "",
+        },
+        Smart::Auto => "",
+    }
+}
 
 fn show_cellgrid(
     grid: &CellGrid,
     styles: StyleChain,
     span: Span,
     borderless: bool,
+    align: &Celled<Smart<Alignment>>,
 ) -> Content {
     let elem = |tag, body| HtmlElem::new(tag).with_body(Some(body)).pack().spanned(span);
     let mut rows: Vec<_> = grid.entries.chunks(grid.non_gutter_column_count()).collect();
 
     let tr = |tag, row: &[Entry]| {
-        let row = row
-            .iter()
-            .flat_map(|entry| entry.as_cell())
-            .map(|cell| show_cell(tag, cell, styles));
-        elem(tag::tr, Content::sequence(row))
+        let mut column = 0;
+        let mut cells = Vec::new();
+        for entry in row {
+            let Some(cell) = entry.as_cell() else { continue };
+            cells.push(show_cell(tag, cell, styles, column_align(align, column)));
+            column += cell.colspan.get();
+        }
+        elem(tag::tr, Content::sequence(cells))
     };
 
     // TODO(subfooters): similarly to headers, take consecutive footers from
@@ -774,10 +796,13 @@ fn sizing_css(sizing: Sizing) -> String {
     }
 }
 
-fn show_cell(tag: HtmlTag, cell: &Cell, styles: StyleChain) -> Content {
+fn show_cell(tag: HtmlTag, cell: &Cell, styles: StyleChain, align: &str) -> Content {
     let body = cell.body.clone();
     let span = |n: NonZeroUsize| (n != NonZeroUsize::MIN).then(|| n.to_string());
     let mut attrs = HtmlAttrs::new();
+    if !align.is_empty() {
+        attrs.push(attr::style, eco_format!("text-align: {align}"));
+    }
 
     let (content, source) = if let Some(table) = body.to_packed::<TableCell>() {
         if let Some(colspan) = span(table.colspan.get(styles)) {
