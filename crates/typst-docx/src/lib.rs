@@ -61,16 +61,17 @@ pub fn docx(
     let mut measured = finalize_measurements(&em.style_samples);
     compute_spacing(&body_runs, &mut measured, &em.blocks, margin_left);
 
-    let content_width = layout
+    let (content_left, content_right) = layout
         .and_then(|doc| doc.pages().first())
         .map(|page| {
-            let width = page.frame.size().x - page.margin.left - page.margin.right;
-            (width.to_pt() * 20.0).round() as i64
+            let size = page.frame.size();
+            (page.margin.left.to_pt(), (size.x - page.margin.right).to_pt())
         })
-        .unwrap_or(9000);
+        .unwrap_or((0.0, 450.0));
 
-    let header = region_part(&all, layout::PageRegion::Header, "w:hdr", content_width);
-    let footer = region_part(&all, layout::PageRegion::Footer, "w:ftr", content_width);
+    let header = region_part(&all, layout::PageRegion::Header, "w:hdr", content_left, content_right);
+    let footer = region_part(&all, layout::PageRegion::Footer, "w:ftr", content_left, content_right);
+    let (header_dist, footer_dist) = header_footer_distances(&all, layout);
 
     let document_xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -78,7 +79,7 @@ pub fn docx(
          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
          <w:body>{}{}</w:body></w:document>",
         em.out,
-        sect_pr(layout, header.is_some(), footer.is_some())
+        sect_pr(layout, header.is_some(), footer.is_some(), header_dist, footer_dist)
     );
 
     package(
@@ -823,7 +824,15 @@ fn escape_xml(text: &str) -> String {
 
 /// Build the section properties (`w:sectPr`) from the layout's page geometry,
 /// so `#set page(...)` is reflected in the `.docx`. Falls back to A4.
-fn sect_pr(layout: Option<&PagedDocument>, header: bool, footer: bool) -> String {
+fn sect_pr(
+    layout: Option<&PagedDocument>,
+    header: bool,
+    footer: bool,
+    header_dist: Option<i64>,
+    footer_dist: Option<i64>,
+) -> String {
+    let header_dist = header_dist.unwrap_or(708);
+    let footer_dist = footer_dist.unwrap_or(708);
     let (pg_sz, pg_mar) = match layout.and_then(|doc| doc.pages().first()) {
         Some(page) => {
             let size = page.frame.size();
@@ -837,7 +846,7 @@ fn sect_pr(layout: Option<&PagedDocument>, header: bool, footer: bool) -> String
                 ),
                 format!(
                     "<w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" \
-                     w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>",
+                     w:header=\"{header_dist}\" w:footer=\"{footer_dist}\" w:gutter=\"0\"/>",
                     twips(margin.top),
                     twips(margin.right),
                     twips(margin.bottom),
@@ -847,9 +856,10 @@ fn sect_pr(layout: Option<&PagedDocument>, header: bool, footer: bool) -> String
         }
         None => (
             "<w:pgSz w:w=\"11906\" w:h=\"16838\"/>".to_string(),
-            "<w:pgMar w:top=\"1134\" w:right=\"1134\" w:bottom=\"1134\" w:left=\"1134\" \
-             w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>"
-                .to_string(),
+            format!(
+                "<w:pgMar w:top=\"1134\" w:right=\"1134\" w:bottom=\"1134\" w:left=\"1134\" \
+                 w:header=\"{header_dist}\" w:footer=\"{footer_dist}\" w:gutter=\"0\"/>"
+            ),
         ),
     };
 
@@ -864,6 +874,35 @@ fn sect_pr(layout: Option<&PagedDocument>, header: bool, footer: bool) -> String
     format!("<w:sectPr>{refs}{pg_sz}{pg_mar}</w:sectPr>")
 }
 
+/// The distances from the page edges to the header/footer, in twips, measured
+/// from the layout so they match Typst's header/footer placement.
+fn header_footer_distances(
+    runs: &[layout::Run],
+    layout: Option<&PagedDocument>,
+) -> (Option<i64>, Option<i64>) {
+    let Some(page) = layout.and_then(|doc| doc.pages().first()) else {
+        return (None, None);
+    };
+    let height = page.frame.size().y.to_pt();
+
+    let header_top = runs
+        .iter()
+        .filter(|run| run.region == layout::PageRegion::Header)
+        .map(|run| run.y_pt - run.ascent_pt)
+        .fold(f64::INFINITY, f64::min);
+    let footer_bottom = runs
+        .iter()
+        .filter(|run| run.region == layout::PageRegion::Footer)
+        .map(|run| run.y_pt + run.descent_pt)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let header = header_top.is_finite().then(|| (header_top * 20.0).round() as i64);
+    let footer = footer_bottom
+        .is_finite()
+        .then(|| ((height - footer_bottom) * 20.0).round() as i64);
+    (header, footer)
+}
+
 /// Build a running header or footer part from the layout runs in that region.
 ///
 /// The HTML export drops page headers/footers, so their content is recovered
@@ -873,7 +912,8 @@ fn region_part(
     runs: &[layout::Run],
     region: layout::PageRegion,
     root: &str,
-    content_width: i64,
+    content_left: f64,
+    content_right: f64,
 ) -> Option<String> {
     let mut lines: Vec<&layout::Run> = runs
         .iter()
@@ -919,18 +959,21 @@ fn region_part(
             .fold(0.0_f64, f64::max);
         let line = ((height + 1.0) * 20.0).round() as i64;
 
+        // A row whose runs sit apart (e.g. a left/right grid) becomes a
+        // borderless table with the grid's measured columns and inset.
+        let separated = group
+            .windows(2)
+            .any(|pair| pair[1].x_pt - (pair[0].x_pt + pair[0].width_pt) > 6.0);
+        if separated && group.len() > 1 {
+            body.push_str(&grid_row(group, content_left, content_right, line));
+            continue;
+        }
+
         body.push_str(&format!(
             "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"{after}\" w:line=\"{line}\" \
-             w:lineRule=\"exact\"/><w:tabs><w:tab w:val=\"right\" w:pos=\"{content_width}\"/>\
-             </w:tabs></w:pPr>"
+             w:lineRule=\"exact\"/></w:pPr>"
         ));
-        for (i, run) in group.iter().enumerate() {
-            if i > 0 {
-                let previous = group[i - 1];
-                if run.x_pt - (previous.x_pt + previous.width_pt) > 6.0 {
-                    body.push_str("<w:r><w:tab/></w:r>");
-                }
-            }
+        for run in group {
             body.push_str(&format_run(run));
         }
         body.push_str("</w:p>");
@@ -941,6 +984,49 @@ fn region_part(
          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
          {body}</{root}>"
     ))
+}
+
+/// Render a header/footer line whose runs sit apart as a borderless table — a
+/// faithful `grid` — with the measured column widths and inset. Cell margins
+/// are zeroed so Word doesn't add its own default padding.
+fn grid_row(group: &[&layout::Run], left: f64, right: f64, line: i64) -> String {
+    let inset = (group[0].x_pt - left).max(0.0);
+    let mut bounds = vec![left];
+    for run in group.iter().skip(1) {
+        let boundary = (run.x_pt - inset).max(*bounds.last().unwrap());
+        bounds.push(boundary);
+    }
+    bounds.push(right);
+
+    let widths: Vec<i64> = (0..group.len())
+        .map(|i| ((bounds[i + 1] - bounds[i]).max(0.0) * 20.0).round() as i64)
+        .collect();
+    let inset_twips = (inset * 20.0).round() as i64;
+
+    let mut out = format!(
+        "<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/>\
+         <w:tblLayout w:type=\"fixed\"/><w:tblCellMar>\
+         <w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"{inset_twips}\" w:type=\"dxa\"/>\
+         <w:bottom w:w=\"0\" w:type=\"dxa\"/><w:right w:w=\"{inset_twips}\" w:type=\"dxa\"/>\
+         </w:tblCellMar></w:tblPr><w:tblGrid>"
+    );
+    for width in &widths {
+        out.push_str(&format!("<w:gridCol w:w=\"{width}\"/>"));
+    }
+    out.push_str("</w:tblGrid><w:tr>");
+    for (i, run) in group.iter().enumerate() {
+        let right_aligned = run.x_pt > bounds[i] + 1.0;
+        out.push_str(&format!(
+            "<w:tc><w:tcPr><w:tcW w:w=\"{}\" w:type=\"dxa\"/></w:tcPr>\
+             <w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"{line}\" \
+             w:lineRule=\"exact\"/>{}</w:pPr>{}</w:p></w:tc>",
+            widths[i],
+            if right_aligned { "<w:jc w:val=\"right\"/>" } else { "" },
+            format_run(run)
+        ));
+    }
+    out.push_str("</w:tr></w:tbl>");
+    out
 }
 
 /// Format a single layout run as a Word run, carrying its resolved typography.

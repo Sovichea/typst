@@ -33,8 +33,7 @@
     #set text(size: 8pt, fill: luma(40%))
     #grid(
       columns: (1fr, auto),
-      [Global Energy Outlook 2026],
-      align(right)[Typsastra Research],
+      [Global Energy Outlook 2026], align(right)[Typsastra Research],
     )
     #v(-0.4em)
     #line(length: 100%, stroke: 0.5pt + luma(75%))
@@ -71,7 +70,7 @@
 Renewable capacity additions reached a record *380 GW* in 2025, up _12%_ year over
 year. Solar accounted for the largest share, followed by wind. This report reviews
 the drivers, the cost trajectory, and the outlook to 2030.#footnote[All figures are
-indicative and are provided for benchmarking only.]
+  indicative and are provided for benchmarking only.]
 
 #v(0.4em)
 
@@ -106,10 +105,10 @@ The terminology used throughout is defined in the appendix.
     inset: 7pt,
     align: (left, right, right, right),
     table.header([Region], [2024], [2025], [Change]),
-    [Africa],   [58],  [71],  [#text(fill: rgb("#2E7D32"))[+22%]],
-    [Asia],     [210], [245], [#text(fill: rgb("#2E7D32"))[+17%]],
-    [Europe],   [64],  [70],  [#text(fill: rgb("#2E7D32"))[+9%]],
-    [Americas], [82],  [84],  [#text(fill: rgb("#2E7D32"))[+2%]],
+    [Africa], [58], [71], [#text(fill: rgb("#2E7D32"))[+22%]],
+    [Asia], [210], [245], [#text(fill: rgb("#2E7D32"))[+17%]],
+    [Europe], [64], [70], [#text(fill: rgb("#2E7D32"))[+9%]],
+    [Americas], [82], [84], [#text(fill: rgb("#2E7D32"))[+2%]],
   ),
   caption: [Capacity additions by region, in gigawatts.],
 )
@@ -149,10 +148,10 @@ Offshore wind faces cost pressure, while onshore remains competitive at good sit
   columns: (auto, 1fr, auto),
   inset: 7pt,
   table.header([Source], [Notes], [LCOE]),
-  [Solar],   [Utility-scale, single-axis tracking], [USD 28],
-  [Wind],    [Onshore, good resource],              [USD 34],
-  [Gas],     [Combined cycle],                      [USD 52],
-  [Nuclear], [New build],                           [USD 90],
+  [Solar], [Utility-scale, single-axis tracking], [USD 28],
+  [Wind], [Onshore, good resource], [USD 34],
+  [Gas], [Combined cycle], [USD 52],
+  [Nuclear], [New build], [USD 90],
 )
 
 = Modelling
@@ -182,9 +181,9 @@ Text may also be #strike[struck through] or #highlight[yellowed].
   align: (left, right, right),
   table.header([Scenario], [2030 additions], [Share of total]),
   table.cell(colspan: 3, align: center)[*Central scenario*],
-  [Solar],   [410], [54%],
-  [Wind],    [205], [27%],
-  [Other],   [145], [19%],
+  [Solar], [410], [54%],
+  [Wind], [205], [27%],
+  [Other], [145], [19%],
 )
 
 #pagebreak()

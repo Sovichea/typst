@@ -97,8 +97,10 @@ top/bottom margin become `word/header1.xml` / `word/footer1.xml`, referenced fro
 
 Each header/footer line gets an **exact** line height from the glyph metrics
 (`w:line` + `lineRule="exact"`), so it doesn't inherit the body's line pitch and
-pad below the baseline. Runs that sit apart on a line (e.g. a left/right grid in a
-header) are separated by a right-aligned tab stop.
+pad below the baseline. The `w:header`/`w:footer` distances are derived from the
+measured header/footer position rather than hardcoded. A line whose runs sit apart
+(a left/right `grid`) becomes a **borderless table** with the measured column
+widths and cell margins zeroed to match the grid's inset.
 
 Not yet emitted from a header: the `#line` divider (a shape) and images.
 
