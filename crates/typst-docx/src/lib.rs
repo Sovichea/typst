@@ -742,9 +742,11 @@ fn resolve_tracks(style: &str, available_pt: f64, col_chars: &[usize]) -> (Vec<i
                     fixed.push(Some(number.trim().parse::<f64>().unwrap_or(0.0) * 10.5));
                     flex.push(0.0);
                 } else {
-                    // `auto`: estimate from the column's widest cell content.
+                    // `auto`: estimate from the column's widest cell content,
+                    // plus a tolerance. Word's font metrics and half-point size
+                    // rounding differ from Typst, so an exact width would wrap.
                     let chars = col_chars.get(index).copied().unwrap_or(0);
-                    fixed.push(Some(chars as f64 * 5.25));
+                    fixed.push(Some(chars as f64 * 5.25 + 20.0));
                     flex.push(0.0);
                 }
                 index += 1;
