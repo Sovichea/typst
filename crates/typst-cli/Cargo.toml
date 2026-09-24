@@ -23,6 +23,7 @@ typst-bundle = { workspace = true }
 typst-eval = { workspace = true }
 typst-layout = { workspace = true }
 typst-html = { workspace = true }
+typst-docx = { workspace = true }
 typst-macros = { workspace = true }
 typst-pdf = { workspace = true }
 typst-render = { workspace = true }

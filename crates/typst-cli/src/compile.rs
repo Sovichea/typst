@@ -116,6 +116,7 @@ impl CompileConfig {
                 Some(ext) if ext.eq_ignore_ascii_case("png") => OutputFormat::Png,
                 Some(ext) if ext.eq_ignore_ascii_case("svg") => OutputFormat::Svg,
                 Some(ext) if ext.eq_ignore_ascii_case("html") => OutputFormat::Html,
+                Some(ext) if ext.eq_ignore_ascii_case("docx") => OutputFormat::Docx,
                 _ => bail!(
                     "could not infer output format for path {}.\n\
                      consider providing the format manually with `--format/-f`",
@@ -137,6 +138,7 @@ impl CompileConfig {
                     OutputFormat::Svg => "svg",
                     OutputFormat::Html => "html",
                     OutputFormat::Bundle => "",
+                    OutputFormat::Docx => "docx",
                 },
             ))
         });
@@ -332,12 +334,30 @@ fn compile_and_export(
                 warnings,
             }
         }
+        OutputFormat::Docx => {
+            let Warned { output, warnings } = typst::compile::<HtmlDocument>(world);
+            let result = output.and_then(|document| export_docx(&document, config));
+            Warned {
+                output: result.map(|()| vec![config.output.clone()]),
+                warnings,
+            }
+        }
         OutputFormat::Bundle => {
             let Warned { output, warnings } = typst::compile::<Bundle>(world);
             let result = output.and_then(|bundle| export_bundle(bundle, config));
             Warned { output: result, warnings }
         }
     }
+}
+
+/// Export to DOCX.
+fn export_docx(document: &HtmlDocument, config: &CompileConfig) -> SourceResult<()> {
+    let bytes = typst_docx::docx(document).at(Span::detached())?;
+    config
+        .output
+        .write(&bytes)
+        .map_err(|err| eco_format!("failed to write DOCX file ({err})"))
+        .at(Span::detached())
 }
 
 /// Export to HTML.
@@ -371,7 +391,7 @@ fn export_paged(
         OutputFormat::Svg => {
             export_image(document, config, ImageExportFormat::Svg).at(Span::detached())
         }
-        OutputFormat::Html | OutputFormat::Bundle => unreachable!(),
+        OutputFormat::Html | OutputFormat::Bundle | OutputFormat::Docx => unreachable!(),
     }
 }
 

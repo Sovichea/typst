@@ -21,6 +21,7 @@ typst-bundle = { path = "crates/typst-bundle", version = "0.15.1" }
 typst-cli = { path = "crates/typst-cli", version = "0.15.1" }
 typst-eval = { path = "crates/typst-eval", version = "0.15.1" }
 typst-html = { path = "crates/typst-html", version = "0.15.1" }
+typst-docx = { path = "crates/typst-docx", version = "0.15.1" }
 typst-ide = { path = "crates/typst-ide", version = "0.15.1" }
 typst-kit = { path = "crates/typst-kit", version = "0.15.1", default-features = false }
 typst-layout = { path = "crates/typst-layout", version = "0.15.1" }

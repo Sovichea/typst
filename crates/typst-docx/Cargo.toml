@@ -1,0 +1,22 @@
+[package]
+name = "typst-docx"
+description = "Typst's DOCX (WordprocessingML) exporter (proof of concept)."
+version = { workspace = true }
+rust-version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+categories = { workspace = true }
+keywords = { workspace = true }
+readme = { workspace = true }
+
+[dependencies]
+typst-html = { workspace = true }
+typst-library = { workspace = true }
+ecow = { workspace = true }
+zip = { workspace = true }
+
+[lints]
+workspace = true

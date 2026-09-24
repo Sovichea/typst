@@ -594,6 +594,8 @@ pub enum OutputFormat {
     Svg,
     Html,
     Bundle,
+    /// Editable DOCX (via Typst's semantic HTML structure).
+    Docx,
 }
 
 impl OutputFormat {
