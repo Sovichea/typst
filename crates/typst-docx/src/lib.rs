@@ -374,6 +374,10 @@ struct Emitter<'a> {
     hyperlinks: Vec<String>,
     /// Footnotes, referenced by id from the body.
     footnotes: Vec<Footnote>,
+    /// Whether the next paragraph is a table-of-contents entry.
+    toc: bool,
+    /// The page number for the next TOC entry.
+    toc_page: Option<u64>,
 }
 
 impl Emitter<'_> {
@@ -405,6 +409,8 @@ impl Emitter<'_> {
             images: Vec::new(),
             hyperlinks: Vec::new(),
             footnotes,
+            toc: false,
+            toc_page: None,
         }
     }
 
@@ -540,9 +546,20 @@ impl Emitter<'_> {
         if let Some(align) = self.align.clone() {
             self.out.push_str(&format!("<w:jc w:val=\"{align}\"/>"));
         }
+        if self.toc {
+            self.out.push_str(&format!(
+                "<w:tabs><w:tab w:val=\"right\" w:leader=\"dot\" w:pos=\"{}\"/></w:tabs>",
+                (self.content_width_pt * 20.0).round() as i64
+            ));
+        }
         self.out.push_str("</w:pPr>");
         for (run, typo) in runs.iter().zip(typos.iter()) {
             self.run(run, typo.as_ref());
+        }
+        if let Some(page) = self.toc_page {
+            self.out.push_str(&format!(
+                "<w:r><w:tab/></w:r><w:r><w:t xml:space=\"preserve\">{page}</w:t></w:r>"
+            ));
         }
         self.out.push_str("</w:p>");
     }
@@ -776,6 +793,24 @@ impl Emitter<'_> {
         }
     }
 
+    /// The page a TOC entry's heading appears on, from the layout.
+    fn toc_page_for(&self, text: &str) -> Option<u64> {
+        let target = collapse(text);
+        if target.is_empty() {
+            return None;
+        }
+        // The heading run is the entry text without its leading section number.
+        let body = target.splitn(2, ' ').nth(1).unwrap_or("").trim();
+        let candidate = if body.is_empty() { target.as_str() } else { body };
+        self.runs
+            .iter()
+            .find(|run| {
+                run.bold
+                    && (collapse(&run.text) == candidate || collapse(&run.text) == target)
+            })
+            .map(|run| run.page)
+    }
+
     /// Emit a list whose HTML carries no markers (e.g. an outline), as plain
     /// indented paragraphs without Word numbering.
     fn plain_list(&mut self, el: &HtmlElement, level: u32) {
@@ -791,9 +826,14 @@ impl Emitter<'_> {
                     _ => collect_inline(grand, false, false, false, None, &mut runs),
                 }
             }
-            self.indent = Some(360 * (level as i64 + 1));
+            self.indent = Some(210 * level as i64);
+            self.toc = true;
+            let entry: String = runs.iter().map(|run| run.text.as_str()).collect();
+            self.toc_page = self.toc_page_for(&entry);
             self.paragraph("ListParagraph", &runs, None);
             self.indent = None;
+            self.toc = false;
+            self.toc_page = None;
 
             for grand in &li.children {
                 if let HtmlNode::Element(g) = grand {
