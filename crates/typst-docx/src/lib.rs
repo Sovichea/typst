@@ -29,9 +29,19 @@ pub fn docx(
     document: &HtmlDocument,
     layout: Option<&PagedDocument>,
 ) -> StrResult<Vec<u8>> {
-    let runs = layout.map(layout::collect_runs).unwrap_or_default();
-    let mut em =
-        Emitter { out: String::new(), runs: &runs, measured: HashMap::new(), blocks: Vec::new() };
+    let all = layout.map(layout::collect_runs).unwrap_or_default();
+    let body_runs: Vec<layout::Run> = all
+        .iter()
+        .filter(|run| run.region == layout::PageRegion::Body)
+        .cloned()
+        .collect();
+
+    let mut em = Emitter {
+        out: String::new(),
+        runs: &body_runs,
+        measured: HashMap::new(),
+        blocks: Vec::new(),
+    };
 
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
@@ -43,7 +53,10 @@ pub fn docx(
         .and_then(|doc| doc.pages().first())
         .map(|page| page.margin.left.to_pt())
         .unwrap_or(0.0);
-    compute_spacing(&runs, &mut em.measured, &em.blocks, margin_left);
+    compute_spacing(&body_runs, &mut em.measured, &em.blocks, margin_left);
+
+    let header = region_part(&all, layout::PageRegion::Header, "w:hdr");
+    let footer = region_part(&all, layout::PageRegion::Footer, "w:ftr");
 
     let document_xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -51,10 +64,10 @@ pub fn docx(
          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
          <w:body>{}{}</w:body></w:document>",
         em.out,
-        sect_pr(layout)
+        sect_pr(layout, header.is_some(), footer.is_some())
     );
 
-    package(&document_xml, &styles(&em.measured))
+    package(&document_xml, &styles(&em.measured), header.as_deref(), footer.as_deref())
 }
 
 fn find_body(el: &HtmlElement) -> Option<&HtmlElement> {
@@ -557,35 +570,168 @@ fn escape_xml(text: &str) -> String {
 
 /// Build the section properties (`w:sectPr`) from the layout's page geometry,
 /// so `#set page(...)` is reflected in the `.docx`. Falls back to A4.
-fn sect_pr(layout: Option<&PagedDocument>) -> String {
-    let Some(page) = layout.and_then(|doc| doc.pages().first()) else {
-        return A4_SECT_PR.to_string();
+fn sect_pr(layout: Option<&PagedDocument>, header: bool, footer: bool) -> String {
+    let (pg_sz, pg_mar) = match layout.and_then(|doc| doc.pages().first()) {
+        Some(page) => {
+            let size = page.frame.size();
+            let margin = page.margin;
+            let twips = |abs: Abs| (abs.to_pt() * 20.0).round() as i64;
+            (
+                format!(
+                    "<w:pgSz w:w=\"{}\" w:h=\"{}\"/>",
+                    twips(size.x),
+                    twips(size.y)
+                ),
+                format!(
+                    "<w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" \
+                     w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>",
+                    twips(margin.top),
+                    twips(margin.right),
+                    twips(margin.bottom),
+                    twips(margin.left),
+                ),
+            )
+        }
+        None => (
+            "<w:pgSz w:w=\"11906\" w:h=\"16838\"/>".to_string(),
+            "<w:pgMar w:top=\"1134\" w:right=\"1134\" w:bottom=\"1134\" w:left=\"1134\" \
+             w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>"
+                .to_string(),
+        ),
     };
-    let size = page.frame.size();
-    let margin = page.margin;
-    let twips = |abs: Abs| (abs.to_pt() * 20.0).round() as i64;
-    format!(
-        "<w:sectPr>\
-         <w:pgSz w:w=\"{}\" w:h=\"{}\"/>\
-         <w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" \
-         w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>\
-         </w:sectPr>",
-        twips(size.x),
-        twips(size.y),
-        twips(margin.top),
-        twips(margin.right),
-        twips(margin.bottom),
-        twips(margin.left),
-    )
+
+    let mut refs = String::new();
+    if header {
+        refs.push_str("<w:headerReference w:type=\"default\" r:id=\"rId3\"/>");
+    }
+    if footer {
+        refs.push_str("<w:footerReference w:type=\"default\" r:id=\"rId4\"/>");
+    }
+
+    format!("<w:sectPr>{refs}{pg_sz}{pg_mar}</w:sectPr>")
 }
 
-const A4_SECT_PR: &str = "<w:sectPr>\
-    <w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
-    <w:pgMar w:top=\"1134\" w:right=\"1134\" w:bottom=\"1134\" w:left=\"1134\" \
-    w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>\
-    </w:sectPr>";
+/// Build a running header or footer part from the layout runs in that region.
+///
+/// The HTML export drops page headers/footers, so their content is recovered
+/// from the compiler-native layout instead. Lines are grouped by baseline and
+/// spaced by the measured gap to the next line.
+fn region_part(
+    runs: &[layout::Run],
+    region: layout::PageRegion,
+    root: &str,
+) -> Option<String> {
+    let mut lines: Vec<&layout::Run> = runs
+        .iter()
+        .filter(|run| run.region == region && run.page == 1 && !run.text.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort_by(|a, b| {
+        a.y_pt
+            .partial_cmp(&b.y_pt)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.x_pt.partial_cmp(&b.x_pt).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
-fn package(document_xml: &str, styles: &str) -> StrResult<Vec<u8>> {
+    let mut groups: Vec<Vec<&layout::Run>> = Vec::new();
+    for run in lines {
+        match groups.last_mut() {
+            Some(last) if (run.y_pt - last[0].y_pt).abs() <= 1.0 => last.push(run),
+            _ => groups.push(vec![run]),
+        }
+    }
+
+    let mut body = String::new();
+    for (index, group) in groups.iter().enumerate() {
+        let after = match groups.get(index + 1) {
+            Some(next) => {
+                let top = next[0].y_pt - next[0].ascent_pt;
+                let bottom = group
+                    .iter()
+                    .map(|run| run.y_pt + run.descent_pt)
+                    .fold(f64::MIN, f64::max);
+                ((top - bottom).max(0.0) * 20.0).round() as i64
+            }
+            None => 0,
+        };
+
+        body.push_str(&format!(
+            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"{after}\"/></w:pPr>"
+        ));
+        for run in group {
+            body.push_str(&format_run(run));
+        }
+        body.push_str("</w:p>");
+    }
+    Some(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <{root} xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         {body}</{root}>"
+    ))
+}
+
+/// Format a single layout run as a Word run, carrying its resolved typography.
+///
+/// A trailing page-number token (e.g. the `1` in "Page 1") becomes a `PAGE`
+/// field, so it updates on every page instead of repeating the literal.
+fn format_run(run: &layout::Run) -> String {
+    let text = run.text.as_str();
+    let trimmed = text.trim_end();
+    let head = trimmed.trim_end_matches(|c: char| c.is_ascii_digit());
+    if head.len() < trimmed.len() {
+        let digits = &trimmed[head.len()..];
+        if digits.parse::<u64>().ok() == Some(run.page) {
+            let mut out = String::new();
+            if !head.is_empty() {
+                out.push_str(&run_text(run, head));
+            }
+            out.push_str(&format!(
+                "<w:fldSimple w:instr=\" PAGE \">{}</w:fldSimple>",
+                run_text(run, digits)
+            ));
+            let suffix = &text[trimmed.len()..];
+            if !suffix.is_empty() {
+                out.push_str(&run_text(run, suffix));
+            }
+            return out;
+        }
+    }
+    run_text(run, text)
+}
+
+/// Format a Word run with the given text and the run's resolved typography.
+fn run_text(run: &layout::Run, text: &str) -> String {
+    let size = (run.size_pt * 2.0).round().max(2.0) as i64;
+    let mut out = String::from("<w:r><w:rPr>");
+    out.push_str(&format!(
+        "<w:rFonts w:ascii=\"{0}\" w:hAnsi=\"{0}\" w:cs=\"{0}\"/>",
+        escape_xml(&run.family)
+    ));
+    if run.bold {
+        out.push_str("<w:b/>");
+    }
+    if run.italic {
+        out.push_str("<w:i/>");
+    }
+    out.push_str(&format!(
+        "<w:color w:val=\"{}\"/><w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/>",
+        run.color
+    ));
+    out.push_str("</w:rPr><w:t xml:space=\"preserve\">");
+    out.push_str(&escape_xml(text));
+    out.push_str("</w:t></w:r>");
+    out
+}
+
+fn package(
+    document_xml: &str,
+    styles: &str,
+    header: Option<&str>,
+    footer: Option<&str>,
+) -> StrResult<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
     let opts = SimpleFileOptions::default();
@@ -601,36 +747,71 @@ fn package(document_xml: &str, styles: &str) -> StrResult<Vec<u8>> {
         Ok(())
     };
 
-    write(&mut zip, "[Content_Types].xml", CONTENT_TYPES)?;
+    write(&mut zip, "[Content_Types].xml", &content_types(header.is_some(), footer.is_some()))?;
     write(&mut zip, "_rels/.rels", ROOT_RELS)?;
     write(&mut zip, "word/document.xml", document_xml)?;
     write(&mut zip, "word/styles.xml", styles)?;
     write(&mut zip, "word/numbering.xml", NUMBERING)?;
-    write(&mut zip, "word/_rels/document.xml.rels", DOC_RELS)?;
+    write(
+        &mut zip,
+        "word/_rels/document.xml.rels",
+        &document_rels(header.is_some(), footer.is_some()),
+    )?;
+    if let Some(header) = header {
+        write(&mut zip, "word/header1.xml", header)?;
+    }
+    if let Some(footer) = footer {
+        write(&mut zip, "word/footer1.xml", footer)?;
+    }
 
     let cursor = zip.finish().map_err(|e| eco_format!("zip finish error: {e}"))?;
     Ok(cursor.into_inner())
 }
 
-const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
-<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
-</Types>"#;
-
+/// The package root relationships.
 const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>"#;
 
-const DOC_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+/// The `[Content_Types].xml` part, including header/footer overrides.
+fn content_types(header: bool, footer: bool) -> String {
+    let mut out = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>"#,
+    );
+    if header {
+        out.push_str("<Override PartName=\"/word/header1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>");
+    }
+    if footer {
+        out.push_str("<Override PartName=\"/word/footer1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
+    }
+    out.push_str("</Types>");
+    out
+}
+
+/// The document relationships, including header/footer parts.
+fn document_rels(header: bool, footer: bool) -> String {
+    let mut out = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
-<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
-</Relationships>"#;
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"#,
+    );
+    if header {
+        out.push_str("<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header1.xml\"/>");
+    }
+    if footer {
+        out.push_str("<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>");
+    }
+    out.push_str("</Relationships>");
+    out
+}
 
 /// Font size in Word half-points.
 fn half_points(measured: &Measured) -> u32 {

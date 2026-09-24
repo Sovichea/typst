@@ -67,10 +67,20 @@ The document deliberately exercises:
 | Page size & margins | ✅ | ✅ | from `#set page(...)` |
 | Block spacing & indent | ✅ | ✅ | line spacing not controlled (Word reflows) |
 | Lists | ✅ | ✅ | bullets/numbers via numbering.xml |
+| **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |
 | **Images** | ✅ | ❌ | `FrameItem::Image` / `<img>` not emitted |
 | **Math** | ✅ | ❌ | MathML not converted |
 | **Footnotes** | ✅ | ❌ | no footnote part / references |
 | **Hyperlinks** | ✅ | ❌ | `<a>` not converted |
-| Headers / footers | ✅ | ❌ | not written to the DOCX section |
 
 Bold entries are the current known gaps surfaced by this benchmark.
+
+### Page header / footer letterhead
+
+`header-letterhead.typ` puts a multi-line letterhead in `#set page(header: ...)`.
+The HTML export drops headers/footers entirely (the page set rule is ignored), so
+their content and spacing are recovered from the **layout oracle**: runs in the
+top/bottom margin become `word/header1.xml` / `word/footer1.xml`, referenced from
+`sectPr`, and repeat on every page. A trailing page number becomes a `PAGE` field.
+Not yet emitted from a header: the `#line` divider (a shape) and images.
+

@@ -15,6 +15,17 @@ use typst_library::visualize::Paint;
 use typst_library::{World, WorldExt};
 use typst_layout::{Page, PagedDocument};
 
+/// Which part of the page a run belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageRegion {
+    /// Within the top margin (a running header).
+    Header,
+    /// The main text area.
+    Body,
+    /// Within the bottom margin (a running footer).
+    Footer,
+}
+
 /// A shaped text run measured from the paged layout.
 #[derive(Clone, Debug)]
 pub struct Run {
@@ -38,6 +49,8 @@ pub struct Run {
     pub y_pt: f64,
     /// The 1-based page number the run appears on.
     pub page: u64,
+    /// Which page region the run belongs to.
+    pub region: PageRegion,
     /// The distance from the baseline to the top of the glyph box, in points.
     pub ascent_pt: f64,
     /// The distance from the baseline to the bottom of the glyph box, in points.
@@ -61,11 +74,22 @@ pub fn layout_json(world: &dyn World, document: &PagedDocument) -> String {
 pub fn collect_runs(document: &PagedDocument) -> Vec<Run> {
     let mut runs = Vec::new();
     for (index, page) in document.pages().iter().enumerate() {
+        let height = page.frame.size().y.to_pt();
+        let top = page.margin.top.to_pt();
+        let bottom = page.margin.bottom.to_pt();
+
         walk(&page.frame, Point::zero(), &mut |text, at| {
             let mut run = run_of(text, None);
             run.x_pt = at.x.to_pt();
             run.y_pt = at.y.to_pt();
             run.page = index as u64 + 1;
+            run.region = if run.y_pt < top {
+                PageRegion::Header
+            } else if run.y_pt > height - bottom {
+                PageRegion::Footer
+            } else {
+                PageRegion::Body
+            };
             runs.push(run);
         });
     }
@@ -133,6 +157,7 @@ fn run_of(text: &TextItem, world: Option<&dyn World>) -> Run {
         x_pt: 0.0,
         y_pt: 0.0,
         page: 0,
+        region: PageRegion::Body,
         ascent_pt: ascent,
         descent_pt: descent,
     }
