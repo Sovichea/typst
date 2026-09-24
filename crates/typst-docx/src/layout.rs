@@ -32,6 +32,16 @@ pub struct Run {
     pub color: String,
     /// The source byte range, if resolvable.
     pub span: Option<Range<usize>>,
+    /// The horizontal position of the run's origin, in points.
+    pub x_pt: f64,
+    /// The vertical position of the run's baseline, in points.
+    pub y_pt: f64,
+    /// The 1-based page number the run appears on.
+    pub page: u64,
+    /// The distance from the baseline to the top of the glyph box, in points.
+    pub ascent_pt: f64,
+    /// The distance from the baseline to the bottom of the glyph box, in points.
+    pub descent_pt: f64,
 }
 
 /// Serialize a paged document's layout to JSON.
@@ -50,9 +60,13 @@ pub fn layout_json(world: &dyn World, document: &PagedDocument) -> String {
 /// Collect every text run in the document, in reading order.
 pub fn collect_runs(document: &PagedDocument) -> Vec<Run> {
     let mut runs = Vec::new();
-    for page in document.pages() {
-        walk(&page.frame, Point::zero(), &mut |text, _| {
-            runs.push(run_of(text, None));
+    for (index, page) in document.pages().iter().enumerate() {
+        walk(&page.frame, Point::zero(), &mut |text, at| {
+            let mut run = run_of(text, None);
+            run.x_pt = at.x.to_pt();
+            run.y_pt = at.y.to_pt();
+            run.page = index as u64 + 1;
+            runs.push(run);
         });
     }
     runs
@@ -98,6 +112,11 @@ fn walk(frame: &Frame, origin: Point, f: &mut dyn FnMut(&TextItem, Point)) {
 fn run_of(text: &TextItem, world: Option<&dyn World>) -> Run {
     let info = text.font.font().info();
     let variant = info.variant;
+    // Use the font's typographic ascent/descent (the line box), not the glyph
+    // ink box, so block gaps can be measured against Typst's own boxes.
+    let metrics = text.font.metrics();
+    let ascent = metrics.ascender.at(text.size).to_pt().abs();
+    let descent = metrics.descender.at(text.size).to_pt().abs();
     Run {
         text: text.text.to_string(),
         family: info.family.clone(),
@@ -111,6 +130,11 @@ fn run_of(text: &TextItem, world: Option<&dyn World>) -> Run {
             _ => "000000".to_string(),
         },
         span: world.and_then(|w| text.glyphs.first().and_then(|g| w.range(g.span.0))),
+        x_pt: 0.0,
+        y_pt: 0.0,
+        page: 0,
+        ascent_pt: ascent,
+        descent_pt: descent,
     }
 }
 
@@ -124,11 +148,14 @@ fn write_run(out: &mut String, run: &Run, at: Point, first: &mut bool) {
     let _ = write!(
         out,
         "{{\"text\":\"{}\",\"xPt\":{:.3},\"yPt\":{:.3},\"sizePt\":{:.3},\
+         \"ascPt\":{:.3},\"descPt\":{:.3},\
          \"font\":\"{}\",\"bold\":{},\"italic\":{},\"color\":\"{}\",\"span\":",
         escape(&run.text),
         at.x.to_pt(),
         at.y.to_pt(),
         run.size_pt,
+        run.ascent_pt,
+        run.descent_pt,
         escape(&run.family),
         run.bold,
         run.italic,

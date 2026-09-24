@@ -30,13 +30,20 @@ pub fn docx(
     layout: Option<&PagedDocument>,
 ) -> StrResult<Vec<u8>> {
     let runs = layout.map(layout::collect_runs).unwrap_or_default();
-    let mut em = Emitter { out: String::new(), runs: &runs, measured: HashMap::new() };
+    let mut em =
+        Emitter { out: String::new(), runs: &runs, measured: HashMap::new(), blocks: Vec::new() };
 
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
             em.block(child);
         }
     }
+
+    let margin_left = layout
+        .and_then(|doc| doc.pages().first())
+        .map(|page| page.margin.left.to_pt())
+        .unwrap_or(0.0);
+    compute_spacing(&runs, &mut em.measured, &em.blocks, margin_left);
 
     let document_xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -81,6 +88,16 @@ struct Measured {
     bold: bool,
     italic: bool,
     color: String,
+    /// The block spacing below this style, in points.
+    after_pt: f64,
+    /// The left indentation of this style, in points.
+    indent_pt: f64,
+}
+
+/// A semantic block (paragraph) emitted from the HTML tree.
+struct Block {
+    style: String,
+    text: String,
 }
 
 /// Accumulates the document body XML.
@@ -88,6 +105,7 @@ struct Emitter<'a> {
     out: String,
     runs: &'a [layout::Run],
     measured: HashMap<&'static str, Measured>,
+    blocks: Vec<Block>,
 }
 
 impl Emitter<'_> {
@@ -161,6 +179,10 @@ impl Emitter<'_> {
 
     fn paragraph(&mut self, style: &str, runs: &[Run], num: Option<(u32, u32)>) {
         self.measure(style, runs);
+        self.blocks.push(Block {
+            style: style.to_string(),
+            text: runs.iter().map(|r| r.text.as_str()).collect(),
+        });
         self.out.push_str("<w:p><w:pPr>");
         self.out
             .push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
@@ -189,6 +211,7 @@ impl Emitter<'_> {
             "Quote" => "Quote",
             "Caption" => "Caption",
             "Code" => "Code",
+            "ListParagraph" => "ListParagraph",
             _ => return,
         };
         if self.measured.contains_key(key) {
@@ -211,6 +234,8 @@ impl Emitter<'_> {
                         bold: run.bold,
                         italic: run.italic,
                         color: run.color.clone(),
+                        after_pt: 0.0,
+                        indent_pt: 0.0,
                     },
                 );
                 return;
@@ -406,9 +431,109 @@ fn collect_inline(
     }
 }
 
-/// Collapse runs of whitespace in a string for text matching.
+/// Normalize text for matching: keep alphanumerics, collapse whitespace and
+/// lowercase, so quotes, dashes and other decoration don't break the match.
 fn collapse(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let filtered: String = text
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect();
+    filtered.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Derive per-style block spacing and indentation from the layout.
+///
+/// Only the space *below* each block is recorded; `space_before` is left at
+/// zero so consecutive blocks don't double up their spacing. Word reflows text,
+/// so intra-paragraph line spacing is deliberately not measured.
+fn compute_spacing(
+    runs: &[layout::Run],
+    measured: &mut HashMap<&'static str, Measured>,
+    blocks: &[Block],
+    margin_left_pt: f64,
+) {
+    // Locate each block's first run with a monotonic cursor, so repeated text
+    // maps to successive occurrences.
+    let mut firsts: Vec<Option<usize>> = Vec::with_capacity(blocks.len());
+    let mut cursor = 0;
+    for block in blocks {
+        let target = collapse(&block.text);
+        let found = if target.is_empty() || cursor >= runs.len() {
+            None
+        } else {
+            let prefix: String = target.chars().take(24).collect();
+            runs[cursor..]
+                .iter()
+                .position(|run| collapse(&run.text).starts_with(&prefix))
+                .map(|offset| cursor + offset)
+        };
+        if let Some(first) = found {
+            cursor = first + 1;
+        }
+        firsts.push(found);
+    }
+
+    let mut after: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut indent: HashMap<&str, Vec<f64>> = HashMap::new();
+
+    for (index, block) in blocks.iter().enumerate() {
+        let Some(first) = firsts[index] else { continue };
+        let Some(last) = block_last(runs, &firsts, index) else { continue };
+        let style = block.style.as_str();
+
+        indent
+            .entry(style)
+            .or_default()
+            .push((runs[first].x_pt - margin_left_pt).max(0.0));
+
+        let Some(next) = firsts.get(index + 1).copied().flatten() else { continue };
+        if runs[next].page == runs[first].page {
+            let top = runs[next].y_pt - runs[next].ascent_pt;
+            let bottom = runs[last].y_pt + runs[last].descent_pt;
+            let gap = top - bottom;
+            if gap > -0.5 {
+                after.entry(style).or_default().push(gap.max(0.0));
+            }
+        }
+    }
+
+    for (style, m) in measured.iter_mut() {
+        if let Some(samples) = after.get(*style) {
+            m.after_pt = median(samples);
+        }
+        if let Some(samples) = indent.get(*style) {
+            m.indent_pt = median(samples);
+        }
+    }
+}
+
+/// The last layout run belonging to block `k`: the line before the next block's
+/// first run, or the final run on the page.
+fn block_last(runs: &[layout::Run], firsts: &[Option<usize>], k: usize) -> Option<usize> {
+    let first = firsts[k]?;
+    let page = runs[first].page;
+
+    if let Some(Some(next)) = firsts.get(k + 1).copied() {
+        if runs[next].page == page && next > first {
+            return Some(next - 1);
+        }
+    }
+
+    let mut last = first;
+    for (offset, run) in runs[first..].iter().enumerate() {
+        if run.page != page {
+            break;
+        }
+        last = first + offset;
+    }
+    Some(last)
+}
+
+/// The median of a non-empty sample set.
+fn median(samples: &[f64]) -> f64 {
+    let mut values = samples.to_vec();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values[values.len() / 2]
 }
 
 fn escape_xml(text: &str) -> String {
@@ -554,6 +679,63 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
                 m.color
             ));
             s = s.replace(anchor, &rpr);
+        }
+    }
+
+    // Patch measured block spacing (space below each block) and indentation.
+    let spacing_patches: [(&str, &str, bool); 6] = [
+        ("Title", "<w:spacing w:before=\"240\" w:after=\"120\"/>", false),
+        (
+            "Heading1",
+            "<w:keepNext/><w:spacing w:before=\"360\" w:after=\"120\"/>",
+            true,
+        ),
+        (
+            "Heading2",
+            "<w:keepNext/><w:spacing w:before=\"240\" w:after=\"80\"/>",
+            true,
+        ),
+        (
+            "Heading3",
+            "<w:keepNext/><w:spacing w:before=\"200\" w:after=\"60\"/>",
+            true,
+        ),
+        (
+            "Heading4",
+            "<w:keepNext/><w:spacing w:before=\"180\" w:after=\"60\"/>",
+            true,
+        ),
+        ("Caption", "<w:spacing w:after=\"160\"/>", false),
+    ];
+    for (style, anchor, keep_next) in spacing_patches {
+        if let Some(m) = measured.get(style) {
+            let after = (m.after_pt * 20.0).round() as i64;
+            let keep = if keep_next { "<w:keepNext/>" } else { "" };
+            s = s.replace(
+                anchor,
+                &format!("{keep}<w:spacing w:before=\"0\" w:after=\"{after}\"/>"),
+            );
+        }
+    }
+
+    if let Some(m) = measured.get("Normal") {
+        let after = (m.after_pt * 20.0).round() as i64;
+        s = s.replace(
+            "<w:spacing w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/>",
+            &format!(
+                "<w:spacing w:after=\"{after}\" w:line=\"276\" w:lineRule=\"auto\"/>"
+            ),
+        );
+    }
+
+    let indent_patches: [(&str, &str); 2] = [
+        ("Quote", "<w:ind w:left=\"567\"/>"),
+        ("ListParagraph", "<w:ind w:left=\"720\"/>"),
+    ];
+    for (style, anchor) in indent_patches {
+        if let Some(m) = measured.get(style) {
+            let left = (m.indent_pt * 20.0).round() as i64;
+            s = s.replace(anchor, &format!("<w:ind w:left=\"{left}\"/>"));
         }
     }
 
