@@ -998,13 +998,22 @@ fn grid_row(group: &[&layout::Run], left: f64, right: f64, line: i64) -> String 
     }
     bounds.push(right);
 
-    let widths: Vec<i64> = (0..group.len())
+    let mut widths: Vec<i64> = (0..group.len())
         .map(|i| ((bounds[i + 1] - bounds[i]).max(0.0) * 20.0).round() as i64)
         .collect();
+    // A hair of slack: Word's text metrics can exceed the measured advance and
+    // wrap a cell that should fit exactly.
+    if let Some(last) = widths.last_mut() {
+        *last += 40;
+    }
+    if widths.len() > 1 {
+        widths[0] = (widths[0] - 40).max(0);
+    }
+    let total: i64 = widths.iter().sum();
     let inset_twips = (inset * 20.0).round() as i64;
 
     let mut out = format!(
-        "<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/>\
+        "<w:tbl><w:tblPr><w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
          <w:tblLayout w:type=\"fixed\"/><w:tblCellMar>\
          <w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"{inset_twips}\" w:type=\"dxa\"/>\
          <w:bottom w:w=\"0\" w:type=\"dxa\"/><w:right w:w=\"{inset_twips}\" w:type=\"dxa\"/>\
