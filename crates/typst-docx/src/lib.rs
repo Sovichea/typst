@@ -1148,17 +1148,19 @@ fn region_part(
 
     let mut body = String::new();
     for (index, (_, piece)) in pieces.iter().enumerate() {
-        let after = match pieces.get(index + 1) {
-            Some((_, next)) => {
-                ((extent(next).0 - extent(piece).1).max(0.0) * 20.0).round() as i64
-            }
-            None => 0,
+        // The gap goes on the *following* piece's `before`, because a piece may
+        // be a table (grid), which cannot carry paragraph spacing.
+        let before = if index == 0 {
+            0
+        } else {
+            let previous = &pieces[index - 1].1;
+            ((extent(piece).0 - extent(previous).1).max(0.0) * 20.0).round() as i64
         };
 
         match piece {
             Piece::Rule(rule) => {
                 let rule: &layout::Rule = rule;
-                body.push_str(&rule_paragraph(rule, after));
+                body.push_str(&rule_paragraph(rule, before));
             }
             Piece::Line(group) => {
                 let group: &[&layout::Run] = group;
@@ -1182,7 +1184,7 @@ fn region_part(
                 }
 
                 body.push_str(&format!(
-                    "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"{after}\" \
+                    "<w:p><w:pPr><w:spacing w:before=\"{before}\" w:after=\"0\" \
                      w:line=\"{line}\" w:lineRule=\"exact\"/></w:pPr>"
                 ));
                 for run in group.iter() {
@@ -1201,12 +1203,12 @@ fn region_part(
 }
 
 /// Render a horizontal rule as an empty paragraph with a bottom border.
-fn rule_paragraph(rule: &layout::Rule, after: i64) -> String {
+fn rule_paragraph(rule: &layout::Rule, before: i64) -> String {
     let sz = (rule.thickness_pt * 8.0).round().clamp(2.0, 96.0) as i64;
     format!(
         "<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"{sz}\" w:space=\"0\" \
          w:color=\"{color}\"/></w:pBdr>\
-         <w:spacing w:before=\"0\" w:after=\"{after}\" w:line=\"20\" w:lineRule=\"exact\"/>\
+         <w:spacing w:before=\"{before}\" w:after=\"0\" w:line=\"20\" w:lineRule=\"exact\"/>\
          </w:pPr></w:p>",
         color = rule.color
     )
