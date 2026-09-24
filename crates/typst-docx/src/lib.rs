@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
 use ecow::eco_format;
-use typst_html::{HtmlDocument, HtmlElement, HtmlNode, tag};
+use typst_html::{HtmlDocument, HtmlElement, HtmlNode, attr, tag};
 use typst_library::diag::StrResult;
 use typst_library::layout::Abs;
 use typst_layout::PagedDocument;
@@ -39,9 +39,10 @@ pub fn docx(
     let mut em = Emitter {
         out: String::new(),
         runs: &body_runs,
-        measured: HashMap::new(),
+        style_samples: HashMap::new(),
         blocks: Vec::new(),
         cursor: 0,
+        align: None,
     };
 
     if let Some(body) = find_body(document.root()) {
@@ -54,7 +55,8 @@ pub fn docx(
         .and_then(|doc| doc.pages().first())
         .map(|page| page.margin.left.to_pt())
         .unwrap_or(0.0);
-    compute_spacing(&body_runs, &mut em.measured, &em.blocks, margin_left);
+    let mut measured = finalize_measurements(&em.style_samples);
+    compute_spacing(&body_runs, &mut measured, &em.blocks, margin_left);
 
     let header = region_part(&all, layout::PageRegion::Header, "w:hdr");
     let footer = region_part(&all, layout::PageRegion::Footer, "w:ftr");
@@ -68,7 +70,7 @@ pub fn docx(
         sect_pr(layout, header.is_some(), footer.is_some())
     );
 
-    package(&document_xml, &styles(&em.measured), header.as_deref(), footer.as_deref())
+    package(&document_xml, &styles(&measured), header.as_deref(), footer.as_deref())
 }
 
 fn find_body(el: &HtmlElement) -> Option<&HtmlElement> {
@@ -130,10 +132,15 @@ struct Block {
 struct Emitter<'a> {
     out: String,
     runs: &'a [layout::Run],
-    measured: HashMap<&'static str, Measured>,
+    /// Per-style samples of resolved typography, reduced to a representative
+    /// value after emission.
+    style_samples: HashMap<&'static str, Vec<Typography>>,
     blocks: Vec<Block>,
     /// Monotonic cursor into `runs` used to match inline runs to layout runs.
     cursor: usize,
+    /// The current paragraph alignment (`w:jc` value), set while recursing into
+    /// an aligned container.
+    align: Option<String>,
 }
 
 impl Emitter<'_> {
@@ -199,16 +206,21 @@ impl Emitter<'_> {
         } else if t == tag::hr {
             // skip
         } else {
-            // div/section/figure/body/... : recurse
+            // div/section/figure/body/... : recurse, honoring a `text-align`.
+            let previous = self.align.clone();
+            if let Some(align) = el.attrs.get(attr::style).and_then(|s| parse_text_align(s)) {
+                self.align = Some(align);
+            }
             for child in &el.children {
                 self.block(child);
             }
+            self.align = previous;
         }
     }
 
     fn paragraph(&mut self, style: &str, runs: &[Run], num: Option<(u32, u32)>) {
-        let base = self.measure(style, runs);
-        let overrides = self.measure_runs(runs, base.as_ref());
+        let typos = self.measure_runs(runs);
+        self.record_sample(style, &typos);
         self.blocks.push(Block {
             style: style.to_string(),
             text: runs.iter().map(|r| r.text.as_str()).collect(),
@@ -221,17 +233,20 @@ impl Emitter<'_> {
                 "<w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/></w:numPr>"
             ));
         }
+        if let Some(align) = self.align.clone() {
+            self.out.push_str(&format!("<w:jc w:val=\"{align}\"/>"));
+        }
         self.out.push_str("</w:pPr>");
-        for (run, typo) in runs.iter().zip(overrides.iter()) {
+        for (run, typo) in runs.iter().zip(typos.iter()) {
             self.run(run, typo.as_ref());
         }
         self.out.push_str("</w:p>");
     }
 
-    /// Record the layout-measured typography for a style, once, by matching the
-    /// paragraph's leading text against a shaped run. Returns that typography so
-    /// inline runs can be compared against it.
-    fn measure(&mut self, style: &str, runs: &[Run]) -> Option<Typography> {
+    /// Record the dominant resolved typography of a block as a sample for its
+    /// style. The representative value is chosen after emission, so an outlier
+    /// block (e.g. the large company name in a letterhead) can't skew a style.
+    fn record_sample(&mut self, style: &str, typos: &[Option<Typography>]) {
         let key: &'static str = match style {
             "Normal" => "Normal",
             "Title" => "Title",
@@ -243,58 +258,17 @@ impl Emitter<'_> {
             "Caption" => "Caption",
             "Code" => "Code",
             "ListParagraph" => "ListParagraph",
-            _ => return None,
+            _ => return,
         };
-        if let Some(m) = self.measured.get(key) {
-            return Some(Typography {
-                family: m.family.clone(),
-                size_pt: m.size_pt,
-                bold: m.bold,
-                italic: m.italic,
-                color: m.color.clone(),
-            });
+        let values: Vec<Typography> = typos.iter().flatten().cloned().collect();
+        if let Some(typo) = mode_typography(&values) {
+            self.style_samples.entry(key).or_default().push(typo);
         }
-
-        let para = collapse(&runs.iter().map(|r| r.text.as_str()).collect::<String>());
-        if para.is_empty() {
-            return None;
-        }
-        let prefix: String = para.chars().take(24).collect();
-
-        for run in self.runs {
-            if collapse(&run.text).starts_with(&prefix) {
-                self.measured.insert(
-                    key,
-                    Measured {
-                        family: run.family.clone(),
-                        size_pt: run.size_pt,
-                        bold: run.bold,
-                        italic: run.italic,
-                        color: run.color.clone(),
-                        after_pt: 0.0,
-                        indent_pt: 0.0,
-                    },
-                );
-                return Some(Typography {
-                    family: run.family.clone(),
-                    size_pt: run.size_pt,
-                    bold: run.bold,
-                    italic: run.italic,
-                    color: run.color.clone(),
-                });
-            }
-        }
-        None
     }
 
-    /// Measure the resolved typography of each run, returning a direct override
-    /// for runs whose typography differs from the paragraph's base style (e.g.
-    /// the large company name in a letterhead).
-    fn measure_runs(
-        &mut self,
-        runs: &[Run],
-        base: Option<&Typography>,
-    ) -> Vec<Option<Typography>> {
+    /// Measure the resolved typography of each run by matching it to a layout
+    /// run. Returns a direct override for every matched run.
+    fn measure_runs(&mut self, runs: &[Run]) -> Vec<Option<Typography>> {
         let mut overrides = vec![None; runs.len()];
         let mut cursor = self.cursor;
 
@@ -319,16 +293,13 @@ impl Emitter<'_> {
             if let Some(offset) = found {
                 let layout_run = &self.runs[cursor + offset];
                 cursor += offset + 1;
-                let typo = Typography {
+                overrides[index] = Some(Typography {
                     family: layout_run.family.clone(),
                     size_pt: layout_run.size_pt,
                     bold: layout_run.bold,
                     italic: layout_run.italic,
                     color: layout_run.color.clone(),
-                };
-                if base != Some(&typo) {
-                    overrides[index] = Some(typo);
-                }
+                });
             }
         }
 
@@ -549,6 +520,21 @@ fn collect_inline(
     }
 }
 
+/// Map a CSS `text-align` declaration to a Word `w:jc` value.
+fn parse_text_align(style: &str) -> Option<String> {
+    for declaration in style.split(';') {
+        if let Some(value) = declaration.trim().strip_prefix("text-align:") {
+            return Some(match value.trim() {
+                "center" => "center".into(),
+                "right" => "right".into(),
+                "justify" => "both".into(),
+                _ => "left".into(),
+            });
+        }
+    }
+    None
+}
+
 /// Normalize text for matching: keep alphanumerics, collapse whitespace and
 /// lowercase, so quotes, dashes and other decoration don't break the match.
 fn collapse(text: &str) -> String {
@@ -652,6 +638,42 @@ fn median(samples: &[f64]) -> f64 {
     let mut values = samples.to_vec();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     values[values.len() / 2]
+}
+
+/// Reduce per-style typography samples to a representative value (the mode).
+fn finalize_measurements(
+    samples: &HashMap<&'static str, Vec<Typography>>,
+) -> HashMap<&'static str, Measured> {
+    let mut measured = HashMap::new();
+    for (style, list) in samples {
+        if let Some(typo) = mode_typography(list) {
+            measured.insert(
+                *style,
+                Measured {
+                    family: typo.family,
+                    size_pt: typo.size_pt,
+                    bold: typo.bold,
+                    italic: typo.italic,
+                    color: typo.color,
+                    after_pt: 0.0,
+                    indent_pt: 0.0,
+                },
+            );
+        }
+    }
+    measured
+}
+
+/// The most frequent typography in a sample set.
+fn mode_typography(list: &[Typography]) -> Option<Typography> {
+    let mut counts: Vec<(Typography, usize)> = Vec::new();
+    for typo in list {
+        match counts.iter_mut().find(|(existing, _)| existing == typo) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((typo.clone(), 1)),
+        }
+    }
+    counts.into_iter().max_by_key(|(_, count)| *count).map(|(typo, _)| typo)
 }
 
 fn escape_xml(text: &str) -> String {

@@ -13,7 +13,9 @@ use typst_library::introspection::{
     Counter, DocumentIntrospection, Locator, QueryIntrospection,
 };
 use typst_library::layout::resolve::{Cell, CellGrid, Entry, Header};
-use typst_library::layout::{BlockElem, HElem, OuterVAlignment, Sizing};
+use typst_library::layout::{
+    AlignElem, BlockElem, HAlignment, HElem, OuterVAlignment, Sizing,
+};
 use typst_library::math::EquationElem;
 use typst_library::math::ir::resolve_equation;
 use typst_library::model::{
@@ -67,6 +69,7 @@ pub fn register(rules: &mut NativeRuleMap) {
     rules.register(Html, CSL_INDENT_RULE);
     rules.register(Html, TABLE_RULE);
     rules.register(Html, TABLE_CELL_RULE);
+    rules.register(Html, ALIGN_RULE);
 
     // Text.
     rules.register(Html, SUB_RULE);
@@ -209,6 +212,22 @@ const DIRECT_LINK_RULE: ShowFn<DirectLinkElem> = |elem, _, _| {
 
 const DIVIDER_RULE: ShowFn<DividerElem> = |elem, _, _| {
     Ok(BlockElem::packed(HtmlElem::new(tag::hr).pack().spanned(elem.span())))
+};
+
+/// `#align` is not yet a first-class HTML concept, but its content must not be
+/// dropped. Emit it as a block-level `<div>`, carrying a horizontal `text-align`
+/// when one is requested.
+const ALIGN_RULE: ShowFn<AlignElem> = |elem, _, styles| {
+    let mut div = HtmlElem::new(tag::div).with_body(Some(elem.body.clone()));
+    if let Some(horizontal) = elem.alignment.get(styles).x() {
+        let value = match horizontal {
+            HAlignment::Center => "center",
+            HAlignment::Right | HAlignment::End => "right",
+            _ => "left",
+        };
+        div = div.with_attr(attr::style, eco_format!("text-align: {value}"));
+    }
+    Ok(BlockElem::packed(div.pack().spanned(elem.span())))
 };
 
 const TITLE_RULE: ShowFn<TitleElem> = |elem, _, styles| {

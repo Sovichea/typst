@@ -67,6 +67,7 @@ The document deliberately exercises:
 | Page size & margins | ✅ | ✅ | from `#set page(...)` |
 | Block spacing & indent | ✅ | ✅ | line spacing not controlled (Word reflows) |
 | Lists | ✅ | ✅ | bullets/numbers via numbering.xml |
+| **Multi-line headings / letterheads** | ✅ | ✅ | `<br>` → `<w:br/>`, inline size/color, `#align` → centered |
 | **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |
 | **Images** | ✅ | ❌ | `FrameItem::Image` / `<img>` not emitted |
 | **Math** | ✅ | ❌ | MathML not converted |
@@ -74,6 +75,15 @@ The document deliberately exercises:
 | **Hyperlinks** | ✅ | ❌ | `<a>` not converted |
 
 Bold entries are the current known gaps surfaced by this benchmark.
+
+### Multi-line headings / body letterheads
+
+A body letterhead is one HTML `<p>` with `<br>` separators and inline `<span>`s of
+different sizes/colors (or an `#align` wrapper). The converter emits `<w:br/>` for
+line breaks, recovers each inline run's resolved family/size/color/bold/italic from
+the layout as a direct `rPr`, and applies `<w:jc>` from `#align`. Style-level
+typography is chosen as the **mode** across blocks so an outlier (the large company
+name) can't skew `Normal`.
 
 ### Page header / footer letterhead
 
