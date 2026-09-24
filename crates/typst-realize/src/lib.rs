@@ -14,12 +14,12 @@ use bumpalo::collections::{CollectIn, String as BumpString, Vec as BumpVec};
 use comemo::Track;
 use ecow::EcoString;
 use typst_html::HtmlElem;
-use typst_library::diag::{At, SourceResult, bail, warning};
+use typst_library::diag::{At, SourceResult, bail};
 use typst_library::engine::Engine;
 use typst_library::foundations::{
     Content, Context, ContextElem, Element, NativeElement, NativeShowRule, Packed,
-    Recipe, RecipeIndex, Selector, SequenceElem, ShowSet, Style, StyleChain, StyledElem,
-    Styles, SymbolElem, Synthesize, Target, TargetElem, Transformation,
+    Recipe, RecipeIndex, Selector, SequenceElem, ShowSet, Smart, Style, StyleChain,
+    StyledElem, Styles, SymbolElem, Synthesize, Target, TargetElem, Transformation,
 };
 use typst_library::introspection::{
     Locatable, LocationKey, SplitLocator, Tag, TagElem, TagFlags, Tagged,
@@ -640,10 +640,23 @@ fn visit_styled<'a>(
                         s.outside = true;
                     }
                     Target::Html => {
-                        s.engine.sink.warn(warning!(
-                            style.span(),
-                            "page set rule was ignored during HTML export"
-                        ));
+                        // Realize the page header/footer as <header>/<footer>
+                        // elements so they are exported (previously dropped).
+                        let chain = StyleChain::new(&local);
+                        let header = chain.get_cloned(PageElem::header);
+                        let footer = chain.get_cloned(PageElem::footer);
+
+                        for (value, tag) in [
+                            (header, typst_html::tag::header),
+                            (footer, typst_html::tag::footer),
+                        ] {
+                            if let Smart::Custom(Some(body)) = value {
+                                let node = s.arenas.content.alloc(
+                                    HtmlElem::new(tag).with_body(Some(body)).pack(),
+                                );
+                                visit(s, node, outer)?;
+                            }
+                        }
                     }
                     Target::Bundle => {}
                 },

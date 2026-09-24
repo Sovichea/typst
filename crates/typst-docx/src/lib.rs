@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
 use ecow::eco_format;
-use typst_html::{HtmlDocument, HtmlElement, HtmlNode, attr, tag};
+use typst_html::{HtmlDocument, HtmlElement, HtmlNode, HtmlTag, attr, tag};
 use typst_library::diag::StrResult;
 use typst_library::layout::Abs;
 use typst_layout::PagedDocument;
@@ -35,48 +35,16 @@ pub fn docx(
         .filter(|run| run.region == layout::PageRegion::Body)
         .cloned()
         .collect();
-
-    let rules = layout.map(layout::collect_rules).unwrap_or_default();
-    // NOTE: body rules are intentionally not emitted from the layout: it cannot
-    // distinguish a standalone `#line` from a table border or a footnote
-    // separator. Body lines should come from the HTML export instead.
-    let body_rules: Vec<layout::Rule> = Vec::new();
-
-    let mut em = Emitter {
-        out: String::new(),
-        runs: &body_runs,
-        style_samples: HashMap::new(),
-        blocks: Vec::new(),
-        cursor: 0,
-        align: None,
-        next_num_id: 100,
-        ordered_num_ids: Vec::new(),
-        indent: None,
-        body_rules,
-        rule_cursor: 0,
-        last_y: 0.0,
-        content_width_pt: layout
-            .and_then(|doc| doc.pages().first())
-            .map(|page| {
-                let size = page.frame.size();
-                (size.x - page.margin.left - page.margin.right).to_pt()
-            })
-            .unwrap_or(450.0),
-    };
-
-    if let Some(body) = find_body(document.root()) {
-        for child in &body.children {
-            em.block(child);
-        }
-    }
-    em.flush_all_rules();
-
-    let margin_left = layout
-        .and_then(|doc| doc.pages().first())
-        .map(|page| page.margin.left.to_pt())
-        .unwrap_or(0.0);
-    let mut measured = finalize_measurements(&em.style_samples);
-    compute_spacing(&body_runs, &mut measured, &em.blocks, margin_left);
+    let header_runs: Vec<layout::Run> = all
+        .iter()
+        .filter(|run| run.region == layout::PageRegion::Header && run.page == 1)
+        .cloned()
+        .collect();
+    let footer_runs: Vec<layout::Run> = all
+        .iter()
+        .filter(|run| run.region == layout::PageRegion::Footer && run.page == 1)
+        .cloned()
+        .collect();
 
     let (content_left, content_right) = layout
         .and_then(|doc| doc.pages().first())
@@ -85,31 +53,24 @@ pub fn docx(
             (page.margin.left.to_pt(), (size.x - page.margin.right).to_pt())
         })
         .unwrap_or((0.0, 450.0));
+    let content_width_pt = content_right - content_left;
 
-    let header_rules: Vec<&layout::Rule> = rules
-        .iter()
-        .filter(|rule| rule.region == layout::PageRegion::Header && rule.page == 1)
-        .collect();
-    let footer_rules: Vec<&layout::Rule> = rules
-        .iter()
-        .filter(|rule| rule.region == layout::PageRegion::Footer && rule.page == 1)
-        .collect();
-    let header = region_part(
-        &all,
-        &header_rules,
-        layout::PageRegion::Header,
-        "w:hdr",
-        content_left,
-        content_right,
-    );
-    let footer = region_part(
-        &all,
-        &footer_rules,
-        layout::PageRegion::Footer,
-        "w:ftr",
-        content_left,
-        content_right,
-    );
+    let mut em = Emitter::new(&body_runs, content_width_pt, false);
+    if let Some(body) = find_body(document.root()) {
+        for child in &body.children {
+            em.block(child);
+        }
+    }
+    em.flush_all_rules();
+
+    let mut measured = finalize_measurements(&em.style_samples);
+    compute_spacing(&body_runs, &mut measured, &em.blocks, content_left);
+
+    // The page header/footer are emitted structurally by the HTML export (grids,
+    // rules, alignment); their typography is recovered from the layout runs in
+    // that region.
+    let header = region_from_html(document.root(), tag::header, &header_runs, content_width_pt);
+    let footer = region_from_html(document.root(), tag::footer, &footer_runs, content_width_pt);
     let (header_dist, footer_dist) = header_footer_distances(&all, layout);
 
     let document_xml = format!(
@@ -134,6 +95,45 @@ pub fn docx(
         header.as_deref(),
         footer.as_deref(),
     )
+}
+
+/// Build a header/footer part from the HTML `<header>`/`<footer>` element,
+/// typed by the layout runs in that region.
+fn region_from_html(
+    root: &HtmlElement,
+    tag_name: HtmlTag,
+    runs: &[layout::Run],
+    content_width_pt: f64,
+) -> Option<String> {
+    let el = find_element(root, tag_name)?;
+    let is_footer = tag_name == tag::footer;
+    let mut em = Emitter::new(runs, content_width_pt, is_footer);
+    for child in &el.children {
+        em.block(child);
+    }
+    let root_name = if tag_name == tag::header { "w:hdr" } else { "w:ftr" };
+    Some(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <{root_name} xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         {}</{root_name}>",
+        em.out
+    ))
+}
+
+/// Find the first descendant element with the given tag.
+fn find_element<'a>(el: &'a HtmlElement, tag_name: HtmlTag) -> Option<&'a HtmlElement> {
+    if el.tag == tag_name {
+        return Some(el);
+    }
+    for child in &el.children {
+        if let HtmlNode::Element(child) = child {
+            if let Some(found) = find_element(child, tag_name) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn find_body(el: &HtmlElement) -> Option<&HtmlElement> {
@@ -220,9 +220,32 @@ struct Emitter<'a> {
     last_y: f64,
     /// The available content width in points, for resolving grid tracks.
     content_width_pt: f64,
+    /// Whether this emitter is building a footer (so a digits-only run becomes
+    /// a `PAGE` field).
+    is_footer: bool,
 }
 
 impl Emitter<'_> {
+    /// Create an emitter over the given layout runs.
+    fn new(runs: &[layout::Run], content_width_pt: f64, is_footer: bool) -> Emitter<'_> {
+        Emitter {
+            out: String::new(),
+            runs,
+            style_samples: HashMap::new(),
+            blocks: Vec::new(),
+            cursor: 0,
+            align: None,
+            next_num_id: 100,
+            ordered_num_ids: Vec::new(),
+            indent: None,
+            body_rules: Vec::new(),
+            rule_cursor: 0,
+            last_y: 0.0,
+            content_width_pt,
+            is_footer,
+        }
+    }
+
     fn block(&mut self, node: &HtmlNode) {
         match node {
             HtmlNode::Element(el) => self.block_el(el),
@@ -291,6 +314,8 @@ impl Emitter<'_> {
             }
         } else if t == tag::table {
             self.table(el);
+        } else if t == tag::header || t == tag::footer {
+            // Written to the DOCX header/footer parts separately.
         } else if t == tag::hr {
             let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
             let (thickness, color) = parse_hr_style(style);
@@ -299,13 +324,21 @@ impl Emitter<'_> {
             self.out
                 .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
         } else {
-            // div/section/figure/body/... : recurse, honoring a `text-align`.
+            // div/section/figure/body/... : honor a `text-align`, then either
+            // recurse (block children) or emit inline content as one paragraph.
             let previous = self.align.clone();
             if let Some(align) = el.attrs.get(attr::style).and_then(|s| parse_text_align(s)) {
                 self.align = Some(align);
             }
-            for child in &el.children {
-                self.block(child);
+            if has_block_child(el) {
+                for child in &el.children {
+                    self.block(child);
+                }
+            } else {
+                let runs = inline(&el.children, false, false, false);
+                if !runs.is_empty() {
+                    self.paragraph("Normal", &runs, None);
+                }
             }
             self.align = previous;
         }
@@ -435,6 +468,36 @@ impl Emitter<'_> {
         if run.br {
             self.out.push_str("<w:r><w:br/></w:r>");
             return;
+        }
+        // A digits-only run in a footer is the page number: emit a PAGE field
+        // so it updates on every page instead of repeating the literal.
+        if self.is_footer {
+            let text = run.text.trim();
+            if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+                let mut rpr = String::new();
+                if let Some(typo) = typo {
+                    let size = (typo.size_pt * 2.0).round().max(2.0) as i64;
+                    rpr.push_str(&format!(
+                        "<w:rFonts w:ascii=\"{0}\" w:hAnsi=\"{0}\" w:cs=\"{0}\"/>",
+                        escape_xml(&typo.family)
+                    ));
+                    if typo.bold {
+                        rpr.push_str("<w:b/>");
+                    }
+                    if typo.italic {
+                        rpr.push_str("<w:i/>");
+                    }
+                    rpr.push_str(&format!(
+                        "<w:color w:val=\"{}\"/><w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/>",
+                        typo.color
+                    ));
+                }
+                self.out.push_str(&format!(
+                    "<w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr>{rpr}</w:rPr>\
+                     <w:t xml:space=\"preserve\">{text}</w:t></w:r></w:fldSimple>"
+                ));
+                return;
+            }
         }
         self.out.push_str("<w:r>");
         if let Some(typo) = typo {
@@ -711,6 +774,19 @@ fn collect_inline(
         }
         _ => {}
     }
+}
+
+/// Whether an element has any block-level child (so it isn't inline content).
+fn has_block_child(el: &HtmlElement) -> bool {
+    el.children.iter().any(|child| {
+        matches!(child, HtmlNode::Element(e) if matches!(
+            e.tag,
+            tag::p | tag::div | tag::section | tag::table | tag::ul | tag::ol | tag::li
+                | tag::h1 | tag::h2 | tag::h3 | tag::h4 | tag::h5 | tag::h6
+                | tag::figure | tag::blockquote | tag::pre | tag::hr
+                | tag::header | tag::footer
+        ))
+    })
 }
 
 /// Whether a list element requests no markers (`list-style-type: none`).
@@ -1113,6 +1189,7 @@ fn header_footer_distances(
 /// The HTML export drops page headers/footers, so their content is recovered
 /// from the compiler-native layout instead. Lines are grouped by baseline and
 /// spaced by the measured gap to the next line.
+#[allow(dead_code)]
 fn region_part(
     runs: &[layout::Run],
     rules: &[&layout::Rule],
@@ -1240,6 +1317,7 @@ fn rule_paragraph(thickness_pt: f64, color: &str, before: i64) -> String {
 /// Render a header/footer line whose runs sit apart as a borderless table — a
 /// faithful `grid` — with the measured column widths and inset. Cell margins
 /// are zeroed so Word doesn't add its own default padding.
+#[allow(dead_code)]
 fn grid_row(group: &[&layout::Run], left: f64, right: f64, line: i64) -> String {
     let inset = (group[0].x_pt - left).max(0.0);
     let mut bounds = vec![left];
@@ -1293,6 +1371,7 @@ fn grid_row(group: &[&layout::Run], left: f64, right: f64, line: i64) -> String 
 ///
 /// A trailing page-number token (e.g. the `1` in "Page 1") becomes a `PAGE`
 /// field, so it updates on every page instead of repeating the literal.
+#[allow(dead_code)]
 fn format_run(run: &layout::Run) -> String {
     let text = run.text.as_str();
     let trimmed = text.trim_end();
@@ -1319,6 +1398,7 @@ fn format_run(run: &layout::Run) -> String {
 }
 
 /// Format a Word run with the given text and the run's resolved typography.
+#[allow(dead_code)]
 fn run_text(run: &layout::Run, text: &str) -> String {
     let size = (run.size_pt * 2.0).round().max(2.0) as i64;
     let mut out = String::from("<w:r><w:rPr>");
