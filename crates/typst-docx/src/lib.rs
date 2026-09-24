@@ -619,6 +619,18 @@ impl Emitter<'_> {
         id
     }
 
+    /// Measure a text's width from the layout runs, if a run matches.
+    fn measure_width(&self, text: &str) -> Option<f64> {
+        let target = collapse(text);
+        if target.is_empty() {
+            return None;
+        }
+        self.runs
+            .iter()
+            .find(|run| collapse(&run.text) == target)
+            .map(|run| run.width_pt)
+    }
+
     fn table(&mut self, el: &HtmlElement) {
         let mut rows: Vec<&HtmlElement> = Vec::new();
         collect_rows(el, &mut rows);
@@ -636,6 +648,7 @@ impl Emitter<'_> {
 
         let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
         let mut col_chars = vec![0usize; cols];
+        let mut col_content: Vec<Option<f64>> = vec![None; cols];
         for row in &rows {
             let mut index = 0;
             for cell in &row.children {
@@ -645,11 +658,14 @@ impl Emitter<'_> {
                 }
                 if index < cols {
                     col_chars[index] = col_chars[index].max(text_len(c));
+                    if let Some(width) = self.measure_width(&text_of(c)) {
+                        col_content[index] = Some(col_content[index].unwrap_or(0.0).max(width));
+                    }
                 }
                 index += 1;
             }
         }
-        let (mut widths, gap) = resolve_tracks(style, self.content_width_pt, &col_chars);
+        let (mut widths, gap) = resolve_tracks(style, self.content_width_pt, &col_content, &col_chars);
         if widths.len() != cols {
             widths = vec![3000; cols];
         }
@@ -803,7 +819,12 @@ fn list_style_none(el: &HtmlElement) -> bool {
 
 /// Resolve a `grid-template-columns` / `column-gap` style into Word column
 /// widths (twips) and a gutter (twips), against the available content width.
-fn resolve_tracks(style: &str, available_pt: f64, col_chars: &[usize]) -> (Vec<i64>, i64) {
+fn resolve_tracks(
+    style: &str,
+    available_pt: f64,
+    col_content: &[Option<f64>],
+    col_chars: &[usize],
+) -> (Vec<i64>, i64) {
     let mut fixed: Vec<Option<f64>> = Vec::new();
     let mut flex: Vec<f64> = Vec::new();
     let mut gap = 0.0;
@@ -823,11 +844,13 @@ fn resolve_tracks(style: &str, available_pt: f64, col_chars: &[usize]) -> (Vec<i
                     fixed.push(Some(number.trim().parse::<f64>().unwrap_or(0.0) * 10.5));
                     flex.push(0.0);
                 } else {
-                    // `auto`: estimate from the column's widest cell content,
-                    // plus a tolerance. Word's font metrics and half-point size
-                    // rounding differ from Typst, so an exact width would wrap.
-                    let chars = col_chars.get(index).copied().unwrap_or(0);
-                    fixed.push(Some(chars as f64 * 5.25 + 20.0));
+                    // `auto`: the measured content width from the layout, with
+                    // a tolerance (Word's metrics and half-point size rounding
+                    // differ from Typst, so an exact width would wrap). Falls
+                    // back to a character-count estimate.
+                    let measured = col_content.get(index).copied().flatten();
+                    let estimate = col_chars.get(index).copied().unwrap_or(0) as f64 * 5.25;
+                    fixed.push(Some(measured.unwrap_or(estimate) + 20.0));
                     flex.push(0.0);
                 }
                 index += 1;
@@ -862,6 +885,23 @@ fn resolve_tracks(style: &str, available_pt: f64, col_chars: &[usize]) -> (Vec<i
         .collect();
 
     (widths, (gap * 20.0).round() as i64)
+}
+
+/// The concatenated text of an element.
+fn text_of(el: &HtmlElement) -> String {
+    let mut out = String::new();
+    collect_text(el, &mut out);
+    out
+}
+
+fn collect_text(el: &HtmlElement, out: &mut String) {
+    for child in &el.children {
+        match child {
+            HtmlNode::Text(text, _) => out.push_str(text),
+            HtmlNode::Element(element) => collect_text(element, out),
+            _ => {}
+        }
+    }
 }
 
 /// The number of characters in an element's text (for `auto` track sizing).
