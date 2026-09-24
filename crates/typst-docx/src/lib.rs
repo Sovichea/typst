@@ -285,6 +285,10 @@ struct Run {
     href: Option<String>,
     /// The footnote id this run references, if any.
     footnote_ref: Option<u32>,
+    /// Whether the run is struck through.
+    strike: bool,
+    /// Whether the run is highlighted.
+    highlight: bool,
 }
 
 /// Typography measured from the paged layout for a given Word style.
@@ -437,6 +441,8 @@ impl Emitter<'_> {
                         br: false,
                         href: None,
                         footnote_ref: None,
+                        strike: false,
+                        highlight: false,
                     }];
                     self.paragraph("Normal", &runs, None);
                 }
@@ -447,6 +453,10 @@ impl Emitter<'_> {
 
     fn block_el(&mut self, el: &HtmlElement) {
         let t = el.tag;
+        // The endnotes section is written to the footnotes part separately.
+        if el.attrs.get(attr::role).map(|r| r.as_str()) == Some("doc-endnotes") {
+            return;
+        }
         // Typst's HTML export reserves <h1> for the document title (`#set
         // document(title: ...)`) and offsets section headings by one, so `=` ->
         // <h2>, `==` -> <h3>, ... Map `=` -> Heading 1, `==` -> Heading 2, ...
@@ -493,6 +503,8 @@ impl Emitter<'_> {
             }
         } else if t == tag::table {
             self.table(el);
+        } else if t == tag::dl {
+            self.definition_list(el);
         } else if t == tag::img {
             self.image(el);
         } else if t == tag::header || t == tag::footer {
@@ -724,8 +736,14 @@ impl Emitter<'_> {
                 "<w:color w:val=\"{}\"/><w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/>",
                 typo.color
             ));
+            if run.strike {
+                self.out.push_str("<w:strike/>");
+            }
+            if run.highlight {
+                self.out.push_str("<w:highlight w:val=\"yellow\"/>");
+            }
             self.out.push_str("</w:rPr>");
-        } else if run.bold || run.italic || run.mono {
+        } else if run.bold || run.italic || run.mono || run.strike || run.highlight {
             self.out.push_str("<w:rPr>");
             if run.mono {
                 self.out.push_str(
@@ -738,6 +756,12 @@ impl Emitter<'_> {
             if run.italic {
                 self.out.push_str("<w:i/>");
             }
+            if run.strike {
+                self.out.push_str("<w:strike/>");
+            }
+            if run.highlight {
+                self.out.push_str("<w:highlight w:val=\"yellow\"/>");
+            }
             self.out.push_str("</w:rPr>");
         }
         self.out.push_str("<w:t xml:space=\"preserve\">");
@@ -745,6 +769,33 @@ impl Emitter<'_> {
         self.out.push_str("</w:t></w:r>");
         if hyperlink.is_some() {
             self.out.push_str("</w:hyperlink>");
+        }
+    }
+
+    /// Emit a definition list (Typst's term list) as a bold term followed by
+    /// its description on one line.
+    fn definition_list(&mut self, el: &HtmlElement) {
+        let mut term: Vec<Run> = Vec::new();
+        for child in &el.children {
+            let HtmlNode::Element(child) = child else { continue };
+            if child.tag == tag::dt {
+                term = inline(&child.children, true, false, false, None);
+            } else if child.tag == tag::dd {
+                let mut runs = std::mem::take(&mut term);
+                runs.push(Run {
+                    text: "  ".to_string(),
+                    bold: false,
+                    italic: false,
+                    mono: false,
+                    br: false,
+                    href: None,
+                    footnote_ref: None,
+                    strike: false,
+                    highlight: false,
+                });
+                runs.extend(inline(&child.children, false, false, false, None));
+                self.paragraph("Normal", &runs, None);
+            }
         }
     }
 
@@ -777,6 +828,8 @@ impl Emitter<'_> {
                     br: false,
                     href: None,
                     footnote_ref: None,
+                    strike: false,
+                    highlight: false,
                 }];
             }
             self.paragraph("ListParagraph", &runs, Some((num_id, level.min(8))));
@@ -977,16 +1030,26 @@ impl Emitter<'_> {
                 if c.tag != tag::td && c.tag != tag::th {
                     continue;
                 }
-                let width = widths.get(cells).copied().unwrap_or(3000);
-                cells += 1;
+                let colspan = c
+                    .attrs
+                    .get(attr::colspan)
+                    .and_then(|value| value.as_str().parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                let mut width = 0;
+                for offset in 0..colspan {
+                    width += widths.get(cells + offset).copied().unwrap_or(3000);
+                }
+                cells += colspan;
                 self.out.push_str("<w:tc><w:tcPr>");
-                if c.tag == tag::th {
-                    self.out
-                        .push_str("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"0B3C5D\"/>");
+                if colspan > 1 {
+                    self.out.push_str(&format!("<w:gridSpan w:val=\"{colspan}\"/>"));
                 }
                 self.out
                     .push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/></w:tcPr>"));
-                let runs = inline(&c.children, c.tag == tag::th, false, false, None);
+                // `table.header` marks the header row for repetition, it does
+                // not style it, so header cells stay plain like Typst's.
+                let runs = inline(&c.children, false, false, false, None);
                 // Cells always contain at least one paragraph.
                 if runs.is_empty() {
                     self.paragraph("Normal", &[], None);
@@ -1054,6 +1117,8 @@ fn collect_inline(
                     br: false,
                     href: href.map(str::to_string),
                     footnote_ref: None,
+                    strike: false,
+                    highlight: false,
                 });
             }
         }
@@ -1072,7 +1137,30 @@ fn collect_inline(
                         br: false,
                         href: None,
                         footnote_ref: Some(id),
+                        strike: false,
+                        highlight: false,
                     });
+                }
+                return;
+            }
+            // Strikethrough and highlight apply to the runs they wrap.
+            if t == tag::s || t == tag::del {
+                let start = runs.len();
+                for child in &el.children {
+                    collect_inline(child, bold, italic, mono, href, runs);
+                }
+                for run in &mut runs[start..] {
+                    run.strike = true;
+                }
+                return;
+            }
+            if t == tag::mark {
+                let start = runs.len();
+                for child in &el.children {
+                    collect_inline(child, bold, italic, mono, href, runs);
+                }
+                for run in &mut runs[start..] {
+                    run.highlight = true;
                 }
                 return;
             }
@@ -1091,6 +1179,8 @@ fn collect_inline(
                     br: true,
                     href: None,
                     footnote_ref: None,
+                    strike: false,
+                    highlight: false,
                 });
                 return;
             } else {
