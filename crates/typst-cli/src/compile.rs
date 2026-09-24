@@ -337,8 +337,17 @@ fn compile_and_export(
             }
         }
         OutputFormat::Docx => {
-            let Warned { output, warnings } = typst::compile::<HtmlDocument>(world);
-            let result = output.and_then(|document| export_docx(&document, config));
+            let Warned { output: html, mut warnings } =
+                typst::compile::<HtmlDocument>(world);
+            let Warned { output: layout, warnings: layout_warnings } =
+                typst::compile::<PagedDocument>(world);
+            warnings.extend(layout_warnings);
+            let result = match (html, layout) {
+                (Ok(document), Ok(layout)) => {
+                    export_docx(&document, Some(&layout), config)
+                }
+                (Err(errors), _) | (_, Err(errors)) => Err(errors),
+            };
             Warned {
                 output: result.map(|()| vec![config.output.clone()]),
                 warnings,
@@ -375,8 +384,12 @@ fn export_layout(
 }
 
 /// Export to DOCX.
-fn export_docx(document: &HtmlDocument, config: &CompileConfig) -> SourceResult<()> {
-    let bytes = typst_docx::docx(document).at(Span::detached())?;
+fn export_docx(
+    document: &HtmlDocument,
+    layout: Option<&PagedDocument>,
+    config: &CompileConfig,
+) -> SourceResult<()> {
+    let bytes = typst_docx::docx(document, layout).at(Span::detached())?;
     config
         .output
         .write(&bytes)

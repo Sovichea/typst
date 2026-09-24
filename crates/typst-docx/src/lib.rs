@@ -5,11 +5,13 @@
 //! tables. This is the "semantic" half of the dual semantic+layout pipeline;
 //! geometry refinement from the paged layout is future work.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
 use ecow::eco_format;
 use typst_html::{HtmlDocument, HtmlElement, HtmlNode, tag};
 use typst_library::diag::StrResult;
+use typst_layout::PagedDocument;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -18,8 +20,16 @@ pub mod layout;
 pub use layout::layout_json;
 
 /// Convert a Typst HTML document into DOCX bytes.
-pub fn docx(document: &HtmlDocument) -> StrResult<Vec<u8>> {
-    let mut em = Emitter { out: String::new() };
+///
+/// When the paged `layout` is provided, the typography resolved by the compiler
+/// is measured from it and baked into the generated Word styles, so the `.docx`
+/// matches what Typst actually rendered.
+pub fn docx(
+    document: &HtmlDocument,
+    layout: Option<&PagedDocument>,
+) -> StrResult<Vec<u8>> {
+    let runs = layout.map(layout::collect_runs).unwrap_or_default();
+    let mut em = Emitter { out: String::new(), runs: &runs, measured: HashMap::new() };
 
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
@@ -35,7 +45,7 @@ pub fn docx(document: &HtmlDocument) -> StrResult<Vec<u8>> {
         em.out, SECT_PR
     );
 
-    package(&document_xml)
+    package(&document_xml, &styles(&em.measured))
 }
 
 fn find_body(el: &HtmlElement) -> Option<&HtmlElement> {
@@ -61,12 +71,24 @@ struct Run {
     mono: bool,
 }
 
-/// Accumulates the document body XML.
-struct Emitter {
-    out: String,
+/// Typography measured from the paged layout for a given Word style.
+#[derive(Clone)]
+struct Measured {
+    family: String,
+    size_pt: f64,
+    bold: bool,
+    italic: bool,
+    color: String,
 }
 
-impl Emitter {
+/// Accumulates the document body XML.
+struct Emitter<'a> {
+    out: String,
+    runs: &'a [layout::Run],
+    measured: HashMap<&'static str, Measured>,
+}
+
+impl Emitter<'_> {
     fn block(&mut self, node: &HtmlNode) {
         match node {
             HtmlNode::Element(el) => self.block_el(el),
@@ -136,6 +158,7 @@ impl Emitter {
     }
 
     fn paragraph(&mut self, style: &str, runs: &[Run], num: Option<(u32, u32)>) {
+        self.measure(style, runs);
         self.out.push_str("<w:p><w:pPr>");
         self.out
             .push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
@@ -149,6 +172,48 @@ impl Emitter {
             self.run(run);
         }
         self.out.push_str("</w:p>");
+    }
+
+    /// Record the layout-measured typography for a style, once, by matching the
+    /// paragraph's leading text against a shaped run.
+    fn measure(&mut self, style: &str, runs: &[Run]) {
+        let key: &'static str = match style {
+            "Normal" => "Normal",
+            "Title" => "Title",
+            "Heading1" => "Heading1",
+            "Heading2" => "Heading2",
+            "Heading3" => "Heading3",
+            "Heading4" => "Heading4",
+            "Quote" => "Quote",
+            "Caption" => "Caption",
+            "Code" => "Code",
+            _ => return,
+        };
+        if self.measured.contains_key(key) {
+            return;
+        }
+
+        let para = collapse(&runs.iter().map(|r| r.text.as_str()).collect::<String>());
+        if para.is_empty() {
+            return;
+        }
+        let prefix: String = para.chars().take(24).collect();
+
+        for run in self.runs {
+            if collapse(&run.text).starts_with(&prefix) {
+                self.measured.insert(
+                    key,
+                    Measured {
+                        family: run.family.clone(),
+                        size_pt: run.size_pt,
+                        bold: run.bold,
+                        italic: run.italic,
+                        color: run.color.clone(),
+                    },
+                );
+                return;
+            }
+        }
     }
 
     fn run(&mut self, run: &Run) {
@@ -339,6 +404,11 @@ fn collect_inline(
     }
 }
 
+/// Collapse runs of whitespace in a string for text matching.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn escape_xml(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -364,7 +434,7 @@ const SECT_PR: &str = "<w:sectPr>\
     w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>\
     </w:sectPr>";
 
-fn package(document_xml: &str) -> StrResult<Vec<u8>> {
+fn package(document_xml: &str, styles: &str) -> StrResult<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
     let opts = SimpleFileOptions::default();
@@ -383,7 +453,7 @@ fn package(document_xml: &str) -> StrResult<Vec<u8>> {
     write(&mut zip, "[Content_Types].xml", CONTENT_TYPES)?;
     write(&mut zip, "_rels/.rels", ROOT_RELS)?;
     write(&mut zip, "word/document.xml", document_xml)?;
-    write(&mut zip, "word/styles.xml", STYLES)?;
+    write(&mut zip, "word/styles.xml", styles)?;
     write(&mut zip, "word/numbering.xml", NUMBERING)?;
     write(&mut zip, "word/_rels/document.xml.rels", DOC_RELS)?;
 
@@ -411,6 +481,61 @@ const DOC_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
 <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
 </Relationships>"#;
 
+/// Font size in Word half-points.
+fn half_points(measured: &Measured) -> u32 {
+    (measured.size_pt * 2.0).round().max(2.0) as u32
+}
+
+/// Build `styles.xml`, patching in the typography measured from the layout.
+fn styles(measured: &HashMap<&str, Measured>) -> String {
+    let mut s = STYLES.to_string();
+
+    if let Some(normal) = measured.get("Normal") {
+        s = s.replace(
+            "<w:rFonts w:ascii=\"Calibri\" w:hAnsi=\"Calibri\" w:cs=\"Calibri\"/>",
+            &format!(
+                "<w:rFonts w:ascii=\"{0}\" w:hAnsi=\"{0}\" w:cs=\"{0}\"/>",
+                normal.family
+            ),
+        );
+        let sz = half_points(normal);
+        s = s.replace(
+            "<w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/>",
+            &format!("<w:sz w:val=\"{sz}\"/><w:szCs w:val=\"{sz}\"/>"),
+        );
+    }
+
+    // Patch the measured heading/title runs, keeping their theme colors.
+    let patches = [
+        ("Title", "<w:b/><w:color w:val=\"0B3C5D\"/><w:sz w:val=\"56\"/>"),
+        ("Heading1", "<w:b/><w:color w:val=\"0B3C5D\"/><w:sz w:val=\"40\"/>"),
+        ("Heading2", "<w:b/><w:color w:val=\"1D6FA5\"/><w:sz w:val=\"28\"/>"),
+        ("Heading3", "<w:b/><w:color w:val=\"1D6FA5\"/><w:sz w:val=\"24\"/>"),
+        ("Heading4", "<w:b/><w:sz w:val=\"22\"/>"),
+    ];
+    for (style, anchor) in patches {
+        if let Some(m) = measured.get(style) {
+            let sz = half_points(m);
+            let mut rpr = String::new();
+            if m.bold {
+                rpr.push_str("<w:b/>");
+            }
+            if m.italic {
+                rpr.push_str("<w:i/>");
+            }
+            rpr.push_str(&format!(
+                "<w:color w:val=\"{}\"/><w:sz w:val=\"{sz}\"/>",
+                m.color
+            ));
+            s = s.replace(anchor, &rpr);
+        }
+    }
+
+    s
+}
+
+/// The `styles.xml` template, with `Normal` typography and the heading/title
+/// `rPr` patched in from the layout measurements.
 const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:docDefaults>
