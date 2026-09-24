@@ -41,6 +41,7 @@ pub fn docx(
         runs: &body_runs,
         measured: HashMap::new(),
         blocks: Vec::new(),
+        cursor: 0,
     };
 
     if let Some(body) = find_body(document.root()) {
@@ -91,6 +92,8 @@ struct Run {
     bold: bool,
     italic: bool,
     mono: bool,
+    /// Whether this run is a hard line break (`<br>` / `\`).
+    br: bool,
 }
 
 /// Typography measured from the paged layout for a given Word style.
@@ -107,6 +110,16 @@ struct Measured {
     indent_pt: f64,
 }
 
+/// Resolved typography of a single run, measured from the layout.
+#[derive(Clone, PartialEq)]
+struct Typography {
+    family: String,
+    size_pt: f64,
+    bold: bool,
+    italic: bool,
+    color: String,
+}
+
 /// A semantic block (paragraph) emitted from the HTML tree.
 struct Block {
     style: String,
@@ -119,6 +132,8 @@ struct Emitter<'a> {
     runs: &'a [layout::Run],
     measured: HashMap<&'static str, Measured>,
     blocks: Vec<Block>,
+    /// Monotonic cursor into `runs` used to match inline runs to layout runs.
+    cursor: usize,
 }
 
 impl Emitter<'_> {
@@ -133,6 +148,7 @@ impl Emitter<'_> {
                         bold: false,
                         italic: false,
                         mono: false,
+                        br: false,
                     }];
                     self.paragraph("Normal", &runs, None);
                 }
@@ -191,7 +207,8 @@ impl Emitter<'_> {
     }
 
     fn paragraph(&mut self, style: &str, runs: &[Run], num: Option<(u32, u32)>) {
-        self.measure(style, runs);
+        let base = self.measure(style, runs);
+        let overrides = self.measure_runs(runs, base.as_ref());
         self.blocks.push(Block {
             style: style.to_string(),
             text: runs.iter().map(|r| r.text.as_str()).collect(),
@@ -205,15 +222,16 @@ impl Emitter<'_> {
             ));
         }
         self.out.push_str("</w:pPr>");
-        for run in runs {
-            self.run(run);
+        for (run, typo) in runs.iter().zip(overrides.iter()) {
+            self.run(run, typo.as_ref());
         }
         self.out.push_str("</w:p>");
     }
 
     /// Record the layout-measured typography for a style, once, by matching the
-    /// paragraph's leading text against a shaped run.
-    fn measure(&mut self, style: &str, runs: &[Run]) {
+    /// paragraph's leading text against a shaped run. Returns that typography so
+    /// inline runs can be compared against it.
+    fn measure(&mut self, style: &str, runs: &[Run]) -> Option<Typography> {
         let key: &'static str = match style {
             "Normal" => "Normal",
             "Title" => "Title",
@@ -225,15 +243,21 @@ impl Emitter<'_> {
             "Caption" => "Caption",
             "Code" => "Code",
             "ListParagraph" => "ListParagraph",
-            _ => return,
+            _ => return None,
         };
-        if self.measured.contains_key(key) {
-            return;
+        if let Some(m) = self.measured.get(key) {
+            return Some(Typography {
+                family: m.family.clone(),
+                size_pt: m.size_pt,
+                bold: m.bold,
+                italic: m.italic,
+                color: m.color.clone(),
+            });
         }
 
         let para = collapse(&runs.iter().map(|r| r.text.as_str()).collect::<String>());
         if para.is_empty() {
-            return;
+            return None;
         }
         let prefix: String = para.chars().take(24).collect();
 
@@ -251,14 +275,92 @@ impl Emitter<'_> {
                         indent_pt: 0.0,
                     },
                 );
-                return;
+                return Some(Typography {
+                    family: run.family.clone(),
+                    size_pt: run.size_pt,
+                    bold: run.bold,
+                    italic: run.italic,
+                    color: run.color.clone(),
+                });
             }
         }
+        None
     }
 
-    fn run(&mut self, run: &Run) {
+    /// Measure the resolved typography of each run, returning a direct override
+    /// for runs whose typography differs from the paragraph's base style (e.g.
+    /// the large company name in a letterhead).
+    fn measure_runs(
+        &mut self,
+        runs: &[Run],
+        base: Option<&Typography>,
+    ) -> Vec<Option<Typography>> {
+        let mut overrides = vec![None; runs.len()];
+        let mut cursor = self.cursor;
+
+        for (index, run) in runs.iter().enumerate() {
+            if run.br {
+                continue;
+            }
+            let target = collapse(&run.text);
+            if target.len() < 3 {
+                continue;
+            }
+
+            let found = if cursor < self.runs.len() {
+                self.runs[cursor..].iter().position(|layout_run| {
+                    let text = collapse(&layout_run.text);
+                    !text.is_empty() && (text.starts_with(&target) || target.starts_with(&text))
+                })
+            } else {
+                None
+            };
+
+            if let Some(offset) = found {
+                let layout_run = &self.runs[cursor + offset];
+                cursor += offset + 1;
+                let typo = Typography {
+                    family: layout_run.family.clone(),
+                    size_pt: layout_run.size_pt,
+                    bold: layout_run.bold,
+                    italic: layout_run.italic,
+                    color: layout_run.color.clone(),
+                };
+                if base != Some(&typo) {
+                    overrides[index] = Some(typo);
+                }
+            }
+        }
+
+        self.cursor = cursor;
+        overrides
+    }
+
+    fn run(&mut self, run: &Run, typo: Option<&Typography>) {
+        if run.br {
+            self.out.push_str("<w:r><w:br/></w:r>");
+            return;
+        }
         self.out.push_str("<w:r>");
-        if run.bold || run.italic || run.mono {
+        if let Some(typo) = typo {
+            let size = (typo.size_pt * 2.0).round().max(2.0) as i64;
+            self.out.push_str("<w:rPr>");
+            self.out.push_str(&format!(
+                "<w:rFonts w:ascii=\"{0}\" w:hAnsi=\"{0}\" w:cs=\"{0}\"/>",
+                escape_xml(&typo.family)
+            ));
+            if typo.bold {
+                self.out.push_str("<w:b/>");
+            }
+            if typo.italic {
+                self.out.push_str("<w:i/>");
+            }
+            self.out.push_str(&format!(
+                "<w:color w:val=\"{}\"/><w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/>",
+                typo.color
+            ));
+            self.out.push_str("</w:rPr>");
+        } else if run.bold || run.italic || run.mono {
             self.out.push_str("<w:rPr>");
             if run.mono {
                 self.out.push_str(
@@ -303,6 +405,7 @@ impl Emitter<'_> {
                     bold: false,
                     italic: false,
                     mono: false,
+                    br: false,
                 }];
             }
             self.paragraph("ListParagraph", &runs, Some((num_id, level.min(8))));
@@ -414,6 +517,7 @@ fn collect_inline(
                     bold,
                     italic,
                     mono,
+                    br: false,
                 });
             }
         }
@@ -431,6 +535,7 @@ fn collect_inline(
                     bold,
                     italic,
                     mono,
+                    br: true,
                 });
                 return;
             } else {
