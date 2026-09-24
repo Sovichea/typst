@@ -110,6 +110,8 @@ struct Measured {
     after_pt: f64,
     /// The left indentation of this style, in points.
     indent_pt: f64,
+    /// The baseline-to-baseline line pitch of this style, in points.
+    line_pt: f64,
 }
 
 /// Resolved typography of a single run, measured from the layout.
@@ -579,6 +581,7 @@ fn compute_spacing(
 
     let mut after: HashMap<&str, Vec<f64>> = HashMap::new();
     let mut indent: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut line: HashMap<&str, Vec<f64>> = HashMap::new();
 
     for (index, block) in blocks.iter().enumerate() {
         let Some(first) = firsts[index] else { continue };
@@ -589,6 +592,14 @@ fn compute_spacing(
             .entry(style)
             .or_default()
             .push((runs[first].x_pt - margin_left_pt).max(0.0));
+
+        // Baseline-to-baseline distance between the block's own lines.
+        for j in first..last {
+            let delta = runs[j + 1].y_pt - runs[j].y_pt;
+            if delta > 0.5 {
+                line.entry(style).or_default().push(delta);
+            }
+        }
 
         let Some(next) = firsts.get(index + 1).copied().flatten() else { continue };
         if runs[next].page == runs[first].page {
@@ -607,6 +618,9 @@ fn compute_spacing(
         }
         if let Some(samples) = indent.get(*style) {
             m.indent_pt = median(samples);
+        }
+        if let Some(samples) = line.get(*style) {
+            m.line_pt = mode_value(samples).unwrap_or(0.0);
         }
     }
 }
@@ -657,11 +671,27 @@ fn finalize_measurements(
                     color: typo.color,
                     after_pt: 0.0,
                     indent_pt: 0.0,
+                    line_pt: 0.0,
                 },
             );
         }
     }
     measured
+}
+
+/// The most frequent value in a sample set (bucketed to 0.5), robust to
+/// outliers such as a paragraph that was resolved to include extra lines.
+fn mode_value(samples: &[f64]) -> Option<f64> {
+    let mut counts: HashMap<i64, (usize, f64)> = HashMap::new();
+    for &value in samples {
+        let bucket = (value * 2.0).round() as i64;
+        let entry = counts.entry(bucket).or_insert((0, value));
+        entry.0 += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.0.cmp(&b.1.0).then(b.0.cmp(&a.0)))
+        .map(|(_, (_, value))| value)
 }
 
 /// The most frequent typography in a sample set.
@@ -990,7 +1020,22 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
         }
     }
 
-    // Patch measured block spacing (space below each block) and indentation.
+    // Patch measured block spacing (space below each block) and line pitch.
+    // `atLeast` enforces Typst's baseline pitch (which includes leading, so it
+    // is larger than the font's natural line height) without clipping.
+    let spacing = |m: &Measured| -> String {
+        let after = (m.after_pt * 20.0).round() as i64;
+        if m.line_pt > 0.0 {
+            let line = (m.line_pt * 20.0).round() as i64;
+            format!(
+                "<w:spacing w:before=\"0\" w:after=\"{after}\" w:line=\"{line}\" \
+                 w:lineRule=\"atLeast\"/>"
+            )
+        } else {
+            format!("<w:spacing w:before=\"0\" w:after=\"{after}\"/>")
+        }
+    };
+
     let spacing_patches: [(&str, &str, bool); 6] = [
         ("Title", "<w:spacing w:before=\"240\" w:after=\"120\"/>", false),
         (
@@ -1017,21 +1062,18 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
     ];
     for (style, anchor, keep_next) in spacing_patches {
         if let Some(m) = measured.get(style) {
-            let after = (m.after_pt * 20.0).round() as i64;
             let keep = if keep_next { "<w:keepNext/>" } else { "" };
-            s = s.replace(
-                anchor,
-                &format!("{keep}<w:spacing w:before=\"0\" w:after=\"{after}\"/>"),
-            );
+            s = s.replace(anchor, &format!("{keep}{}", spacing(m)));
         }
     }
 
+    // `Normal` has no `pPr` in the template; add one so its line pitch applies.
     if let Some(m) = measured.get("Normal") {
-        let after = (m.after_pt * 20.0).round() as i64;
         s = s.replace(
-            "<w:spacing w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/>",
+            "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:uiPriority w:val=\"0\"/><w:qFormat/></w:style>",
             &format!(
-                "<w:spacing w:after=\"{after}\" w:line=\"276\" w:lineRule=\"auto\"/>"
+                "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:uiPriority w:val=\"0\"/><w:qFormat/><w:pPr>{}</w:pPr></w:style>",
+                spacing(m)
             ),
         );
     }

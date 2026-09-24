@@ -65,7 +65,8 @@ The document deliberately exercises:
 | Tables (header, colspan) | ✅ | ✅ | column widths still fixed |
 | Typography (font/size/color) | ✅ | ✅ | measured from layout |
 | Page size & margins | ✅ | ✅ | from `#set page(...)` |
-| Block spacing & indent | ✅ | ✅ | line spacing not controlled (Word reflows) |
+| Block spacing & indent | ✅ | ✅ | space-below + left indent + line pitch (`w:line`, `atLeast`) |
+| Line pitch (intra-paragraph) | ✅ | ✅ | measured baseline-to-baseline; `atLeast` avoids clipping. Line *breaking* still follows Word |
 | Lists | ✅ | ✅ | bullets/numbers via numbering.xml |
 | **Multi-line headings / letterheads** | ✅ | ✅ | `<br>` → `<w:br/>`, inline size/color, `#align` → centered |
 | **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |

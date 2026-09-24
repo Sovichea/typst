@@ -47,7 +47,7 @@
   ],
 )
 
-#set text(font: "New Computer Modern", size: 10.5pt, lang: "en")
+#set text(font: "Calibri", size: 10.5pt, lang: "en")
 #set par(justify: true, leading: 0.65em)
 #set heading(numbering: "1.1")
 
