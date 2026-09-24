@@ -74,7 +74,7 @@ The document deliberately exercises:
 | **Images** | ✅ | ✅ | embedded from the `<img>` data URI, sized from the layout |
 | **Math** | ✅ | ❌ | MathML not converted |
 | **Footnotes** | ✅ | ❌ | no footnote part / references |
-| **Hyperlinks** | ✅ | ❌ | `<a>` not converted |
+| **Hyperlinks** | ✅ | ✅ | external `http(s)` links → `w:hyperlink` + external rel (internal/TOC links not yet) |
 
 Bold entries are the current known gaps surfaced by this benchmark.
 

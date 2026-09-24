@@ -125,6 +125,7 @@ pub fn docx(
         header.as_deref(),
         footer.as_deref(),
         &em.images,
+        &em.hyperlinks,
     )
 }
 
@@ -191,6 +192,8 @@ struct Run {
     mono: bool,
     /// Whether this run is a hard line break (`<br>` / `\`).
     br: bool,
+    /// The external URL this run links to, if any.
+    href: Option<String>,
 }
 
 /// Typography measured from the paged layout for a given Word style.
@@ -270,6 +273,8 @@ struct Emitter<'a> {
     image_cursor: usize,
     /// Embedded image parts collected while emitting.
     images: Vec<Media>,
+    /// External hyperlink targets, in order of first use.
+    hyperlinks: Vec<String>,
 }
 
 impl Emitter<'_> {
@@ -298,7 +303,17 @@ impl Emitter<'_> {
             layout_images,
             image_cursor: 0,
             images: Vec::new(),
+            hyperlinks: Vec::new(),
         }
+    }
+
+    /// The relationship id for an external URL, allocating one if new.
+    fn hyperlink_id(&mut self, url: &str) -> String {
+        if let Some(index) = self.hyperlinks.iter().position(|h| h == url) {
+            return format!("rId{}", 200 + index + 1);
+        }
+        self.hyperlinks.push(url.to_string());
+        format!("rId{}", 200 + self.hyperlinks.len())
     }
 
     fn block(&mut self, node: &HtmlNode) {
@@ -313,6 +328,7 @@ impl Emitter<'_> {
                         italic: false,
                         mono: false,
                         br: false,
+                        href: None,
                     }];
                     self.paragraph("Normal", &runs, None);
                 }
@@ -328,31 +344,31 @@ impl Emitter<'_> {
         // <h2>, `==` -> <h3>, ... Map `=` -> Heading 1, `==` -> Heading 2, ...
         // (and the document title -> Title).
         if t == tag::h1 {
-            let runs = inline(&el.children, false, false, false);
+            let runs = inline(&el.children, false, false, false, None);
             self.paragraph("Title", &runs, None);
         } else if t == tag::h2 {
-            let runs = inline(&el.children, false, false, false);
+            let runs = inline(&el.children, false, false, false, None);
             self.paragraph("Heading1", &runs, None);
         } else if t == tag::h3 {
-            let runs = inline(&el.children, false, false, false);
+            let runs = inline(&el.children, false, false, false, None);
             self.paragraph("Heading2", &runs, None);
         } else if t == tag::h4 {
-            let runs = inline(&el.children, false, false, false);
+            let runs = inline(&el.children, false, false, false, None);
             self.paragraph("Heading3", &runs, None);
         } else if t == tag::h5 || t == tag::h6 {
-            let runs = inline(&el.children, false, false, false);
+            let runs = inline(&el.children, false, false, false, None);
             self.paragraph("Heading4", &runs, None);
         } else if t == tag::p {
-            let runs = inline(&el.children, false, false, false);
+            let runs = inline(&el.children, false, false, false, None);
             self.paragraph("Normal", &runs, None);
         } else if t == tag::blockquote {
-            let runs = inline(&el.children, false, true, false);
+            let runs = inline(&el.children, false, true, false, None);
             self.paragraph("Quote", &runs, None);
         } else if t == tag::pre {
-            let runs = inline(&el.children, false, false, true);
+            let runs = inline(&el.children, false, false, true, None);
             self.paragraph("Code", &runs, None);
         } else if t == tag::figcaption || t == tag::caption {
-            let runs = inline(&el.children, false, true, false);
+            let runs = inline(&el.children, false, true, false, None);
             self.paragraph("Caption", &runs, None);
         } else if t == tag::ul {
             if list_style_none(el) {
@@ -392,7 +408,7 @@ impl Emitter<'_> {
                     self.block(child);
                 }
             } else {
-                let runs = inline(&el.children, false, false, false);
+                let runs = inline(&el.children, false, false, false, None);
                 if !runs.is_empty() {
                     self.paragraph("Normal", &runs, None);
                 }
@@ -556,6 +572,14 @@ impl Emitter<'_> {
                 return;
             }
         }
+        let hyperlink = match &run.href {
+            Some(url) => {
+                let id = self.hyperlink_id(url);
+                self.out.push_str(&format!("<w:hyperlink r:id=\"{id}\">"));
+                Some(id)
+            }
+            None => None,
+        };
         self.out.push_str("<w:r>");
         if let Some(typo) = typo {
             let size = (typo.size_pt * 2.0).round().max(2.0) as i64;
@@ -593,6 +617,9 @@ impl Emitter<'_> {
         self.out.push_str("<w:t xml:space=\"preserve\">");
         self.out.push_str(&escape_xml(&run.text));
         self.out.push_str("</w:t></w:r>");
+        if hyperlink.is_some() {
+            self.out.push_str("</w:hyperlink>");
+        }
     }
 
     /// Emit a list, recursing into nested lists. `ordered` selects whether a
@@ -612,7 +639,7 @@ impl Emitter<'_> {
                     {
                         // handled below
                     }
-                    _ => collect_inline(grand, false, false, false, &mut runs),
+                    _ => collect_inline(grand, false, false, false, None, &mut runs),
                 }
             }
             if runs.iter().all(|r| r.text.trim().is_empty()) {
@@ -622,6 +649,7 @@ impl Emitter<'_> {
                     italic: false,
                     mono: false,
                     br: false,
+                    href: None,
                 }];
             }
             self.paragraph("ListParagraph", &runs, Some((num_id, level.min(8))));
@@ -650,7 +678,7 @@ impl Emitter<'_> {
             for grand in &li.children {
                 match grand {
                     HtmlNode::Element(g) if g.tag == tag::ul || g.tag == tag::ol => {}
-                    _ => collect_inline(grand, false, false, false, &mut runs),
+                    _ => collect_inline(grand, false, false, false, None, &mut runs),
                 }
             }
             self.indent = Some(360 * (level as i64 + 1));
@@ -808,7 +836,7 @@ impl Emitter<'_> {
                 }
                 self.out
                     .push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/></w:tcPr>"));
-                let runs = inline(&c.children, c.tag == tag::th, false, false);
+                let runs = inline(&c.children, c.tag == tag::th, false, false, None);
                 // Cells always contain at least one paragraph.
                 if runs.is_empty() {
                     self.paragraph("Normal", &[], None);
@@ -843,10 +871,16 @@ fn collect_rows<'a>(el: &'a HtmlElement, rows: &mut Vec<&'a HtmlElement>) {
     }
 }
 
-fn inline(nodes: &[HtmlNode], bold: bool, italic: bool, mono: bool) -> Vec<Run> {
+fn inline(
+    nodes: &[HtmlNode],
+    bold: bool,
+    italic: bool,
+    mono: bool,
+    href: Option<&str>,
+) -> Vec<Run> {
     let mut runs = Vec::new();
     for node in nodes {
-        collect_inline(node, bold, italic, mono, &mut runs);
+        collect_inline(node, bold, italic, mono, href, &mut runs);
     }
     runs
 }
@@ -856,6 +890,7 @@ fn collect_inline(
     bold: bool,
     italic: bool,
     mono: bool,
+    href: Option<&str>,
     runs: &mut Vec<Run>,
 ) {
     match node {
@@ -867,6 +902,7 @@ fn collect_inline(
                     italic,
                     mono,
                     br: false,
+                    href: href.map(str::to_string),
                 });
             }
         }
@@ -885,13 +921,24 @@ fn collect_inline(
                     italic,
                     mono,
                     br: true,
+                    href: None,
                 });
                 return;
             } else {
                 (bold, italic, mono)
             };
+            // An external link applies to its children.
+            let child_href = if t == tag::a {
+                el.attrs
+                    .get(attr::href)
+                    .map(|h| h.as_str())
+                    .filter(|h| h.starts_with("http://") || h.starts_with("https://"))
+                    .or(href)
+            } else {
+                href
+            };
             for child in &el.children {
-                collect_inline(child, b, i, m, runs);
+                collect_inline(child, b, i, m, child_href, runs);
             }
         }
         _ => {}
@@ -1371,6 +1418,7 @@ fn package(
     header: Option<&str>,
     footer: Option<&str>,
     images: &[Media],
+    hyperlinks: &[String],
 ) -> StrResult<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
@@ -1399,7 +1447,7 @@ fn package(
     write(
         &mut zip,
         "word/_rels/document.xml.rels",
-        &document_rels(header.is_some(), footer.is_some(), images),
+        &document_rels(header.is_some(), footer.is_some(), images, hyperlinks),
     )?;
     if let Some(header) = header {
         write(&mut zip, "word/header1.xml", header)?;
@@ -1456,7 +1504,12 @@ fn content_types(header: bool, footer: bool, images: &[Media]) -> String {
 }
 
 /// The document relationships, including header/footer and image parts.
-fn document_rels(header: bool, footer: bool, images: &[Media]) -> String {
+fn document_rels(
+    header: bool,
+    footer: bool,
+    images: &[Media],
+    hyperlinks: &[String],
+) -> String {
     let mut out = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -1473,6 +1526,13 @@ fn document_rels(header: bool, footer: bool, images: &[Media]) -> String {
         out.push_str(&format!(
             "<Relationship Id=\"{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/{}\"/>",
             media.rel_id, media.name
+        ));
+    }
+    for (index, url) in hyperlinks.iter().enumerate() {
+        out.push_str(&format!(
+            "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{}\" TargetMode=\"External\"/>",
+            200 + index + 1,
+            escape_xml(url)
         ));
     }
     out.push_str("</Relationships>");
