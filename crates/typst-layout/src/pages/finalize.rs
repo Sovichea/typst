@@ -79,5 +79,5 @@ pub fn finalize(
     let number = counter.logical();
     counter.step();
 
-    Ok(Page { frame, bleed, fill, numbering, supplement, number })
+    Ok(Page { frame, margin, bleed, fill, numbering, supplement, number })
 }

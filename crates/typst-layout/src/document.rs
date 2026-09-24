@@ -83,6 +83,9 @@ impl Output for PagedDocument {
 pub struct Page {
     /// The frame that defines the page.
     pub frame: Frame,
+    /// The page's resolved margins. These are included in `frame`, which spans
+    /// the full page.
+    pub margin: Sides<Abs>,
     /// The bleed amount to be added on each side of the page. The bleed is not
     /// included in frame.
     pub bleed: Sides<Abs>,

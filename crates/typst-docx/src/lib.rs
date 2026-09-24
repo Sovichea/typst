@@ -11,6 +11,7 @@ use std::io::{Cursor, Write};
 use ecow::eco_format;
 use typst_html::{HtmlDocument, HtmlElement, HtmlNode, tag};
 use typst_library::diag::StrResult;
+use typst_library::layout::Abs;
 use typst_layout::PagedDocument;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -42,7 +43,8 @@ pub fn docx(
          <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
          <w:body>{}{}</w:body></w:document>",
-        em.out, SECT_PR
+        em.out,
+        sect_pr(layout)
     );
 
     package(&document_xml, &styles(&em.measured))
@@ -428,7 +430,31 @@ fn escape_xml(text: &str) -> String {
     out
 }
 
-const SECT_PR: &str = "<w:sectPr>\
+/// Build the section properties (`w:sectPr`) from the layout's page geometry,
+/// so `#set page(...)` is reflected in the `.docx`. Falls back to A4.
+fn sect_pr(layout: Option<&PagedDocument>) -> String {
+    let Some(page) = layout.and_then(|doc| doc.pages().first()) else {
+        return A4_SECT_PR.to_string();
+    };
+    let size = page.frame.size();
+    let margin = page.margin;
+    let twips = |abs: Abs| (abs.to_pt() * 20.0).round() as i64;
+    format!(
+        "<w:sectPr>\
+         <w:pgSz w:w=\"{}\" w:h=\"{}\"/>\
+         <w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" \
+         w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>\
+         </w:sectPr>",
+        twips(size.x),
+        twips(size.y),
+        twips(margin.top),
+        twips(margin.right),
+        twips(margin.bottom),
+        twips(margin.left),
+    )
+}
+
+const A4_SECT_PR: &str = "<w:sectPr>\
     <w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
     <w:pgMar w:top=\"1134\" w:right=\"1134\" w:bottom=\"1134\" w:left=\"1134\" \
     w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/>\
