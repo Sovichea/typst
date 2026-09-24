@@ -8,14 +8,13 @@ use typst_library::diag::{At, warning};
 use typst_library::foundations::{
     Content, Context, NativeElement, NativeRuleMap, Selector, ShowFn, Smart, StyleChain,
     Target,
-};
-use typst_library::introspection::{
+};use typst_library::introspection::{
     Counter, DocumentIntrospection, Locator, QueryIntrospection,
 };
 use typst_library::layout::resolve::{Cell, CellGrid, Entry, Header};
 use typst_library::layout::{
     AlignElem, BlockElem, GridCell, GridElem, HAlignment, HElem, Length, OuterVAlignment,
-    Sizing,
+    PagebreakElem, Sizing,
 };
 use typst_library::math::EquationElem;
 use typst_library::math::ir::resolve_equation;
@@ -32,7 +31,7 @@ use typst_library::text::{
     HighlightElem, LinebreakElem, OverlineElem, RawElem, RawLine, SmallcapsElem,
     SpaceElem, StrikeElem, SubElem, SuperElem, UnderlineElem,
 };
-use typst_library::visualize::{Color, ImageElem};
+use typst_library::visualize::{Color, ImageElem, LineElem, Paint};
 use typst_syntax::Span;
 
 use crate::mathml::convert_math_to_nodes;
@@ -71,6 +70,8 @@ pub fn register(rules: &mut NativeRuleMap) {
     rules.register(Html, TABLE_RULE);
     rules.register(Html, TABLE_CELL_RULE);
     rules.register(Html, GRID_RULE);
+    rules.register(Html, LINE_RULE);
+    rules.register(Html, PAGEBREAK_RULE);
     rules.register(Html, ALIGN_RULE);
 
     // Text.
@@ -214,6 +215,35 @@ const DIRECT_LINK_RULE: ShowFn<DirectLinkElem> = |elem, _, _| {
 
 const DIVIDER_RULE: ShowFn<DividerElem> = |elem, _, _| {
     Ok(BlockElem::packed(HtmlElem::new(tag::hr).pack().spanned(elem.span())))
+};
+
+/// A `#line` becomes a `<hr>` carrying its thickness and color, so a downstream
+/// consumer can reproduce it (previously it was dropped).
+const LINE_RULE: ShowFn<LineElem> = |elem, _, styles| {
+    let stroke = elem.stroke.get_cloned(styles);
+    let thickness = stroke.thickness.unwrap_or(Length::zero()).abs.to_pt().max(0.5);
+    let color = match stroke.paint.unwrap_or(Paint::Solid(Color::BLACK)) {
+        Paint::Solid(color) => color.to_hex().trim_start_matches('#').to_string(),
+        _ => "000000".to_string(),
+    };
+    let style = eco_format!("border-top-width: {thickness}pt; border-top-color: #{color}");
+    Ok(BlockElem::packed(
+        HtmlElem::new(tag::hr)
+            .with_attr(attr::style, style)
+            .pack()
+            .spanned(elem.span()),
+    ))
+};
+
+/// A `#pagebreak()` becomes a `<div class="pagebreak">` so a downstream
+/// consumer can emit a page break.
+const PAGEBREAK_RULE: ShowFn<PagebreakElem> = |elem, _, _| {
+    Ok(BlockElem::packed(
+        HtmlElem::new(tag::div)
+            .with_attr(attr::class, "pagebreak")
+            .pack()
+            .spanned(elem.span()),
+    ))
 };
 
 /// `#align` is not yet a first-class HTML concept, but its content must not be

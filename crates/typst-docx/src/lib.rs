@@ -292,7 +292,12 @@ impl Emitter<'_> {
         } else if t == tag::table {
             self.table(el);
         } else if t == tag::hr {
-            // skip
+            let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
+            let (thickness, color) = parse_hr_style(style);
+            self.out.push_str(&rule_paragraph(thickness, &color, 0));
+        } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("pagebreak") {
+            self.out
+                .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
         } else {
             // div/section/figure/body/... : recurse, honoring a `text-align`.
             let previous = self.align.clone();
@@ -412,7 +417,7 @@ impl Emitter<'_> {
             && self.body_rules[self.rule_cursor].y_pt < self.last_y
         {
             let rule = self.body_rules[self.rule_cursor].clone();
-            self.out.push_str(&rule_paragraph(&rule, 0));
+            self.out.push_str(&rule_paragraph(rule.thickness_pt, &rule.color, 0));
             self.rule_cursor += 1;
         }
     }
@@ -421,7 +426,7 @@ impl Emitter<'_> {
     fn flush_all_rules(&mut self) {
         while self.rule_cursor < self.body_rules.len() {
             let rule = self.body_rules[self.rule_cursor].clone();
-            self.out.push_str(&rule_paragraph(&rule, 0));
+            self.out.push_str(&rule_paragraph(rule.thickness_pt, &rule.color, 0));
             self.rule_cursor += 1;
         }
     }
@@ -796,6 +801,25 @@ fn text_len(el: &HtmlElement) -> usize {
     count
 }
 
+/// Parse a `border-top-width`/`border-top-color` style into (thickness pt, color).
+fn parse_hr_style(style: &str) -> (f64, String) {
+    let mut thickness = 0.5;
+    let mut color = "000000".to_string();
+    for declaration in style.split(';') {
+        let declaration = declaration.trim();
+        if let Some(value) = declaration.strip_prefix("border-top-width:") {
+            thickness = value
+                .trim()
+                .strip_suffix("pt")
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0.5);
+        } else if let Some(value) = declaration.strip_prefix("border-top-color:") {
+            color = value.trim().trim_start_matches('#').to_ascii_uppercase();
+        }
+    }
+    (thickness, color)
+}
+
 /// Map a CSS `text-align` declaration to a Word `w:jc` value.
 fn parse_text_align(style: &str) -> Option<String> {
     for declaration in style.split(';') {
@@ -1160,7 +1184,7 @@ fn region_part(
         match piece {
             Piece::Rule(rule) => {
                 let rule: &layout::Rule = rule;
-                body.push_str(&rule_paragraph(rule, before));
+                body.push_str(&rule_paragraph(rule.thickness_pt, &rule.color, before));
             }
             Piece::Line(group) => {
                 let group: &[&layout::Run] = group;
@@ -1203,14 +1227,13 @@ fn region_part(
 }
 
 /// Render a horizontal rule as an empty paragraph with a bottom border.
-fn rule_paragraph(rule: &layout::Rule, before: i64) -> String {
-    let sz = (rule.thickness_pt * 8.0).round().clamp(2.0, 96.0) as i64;
+fn rule_paragraph(thickness_pt: f64, color: &str, before: i64) -> String {
+    let sz = (thickness_pt * 8.0).round().clamp(2.0, 96.0) as i64;
     format!(
         "<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"{sz}\" w:space=\"0\" \
          w:color=\"{color}\"/></w:pBdr>\
          <w:spacing w:before=\"{before}\" w:after=\"0\" w:line=\"20\" w:lineRule=\"exact\"/>\
-         </w:pPr></w:p>",
-        color = rule.color
+         </w:pPr></w:p>"
     )
 }
 
