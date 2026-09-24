@@ -73,7 +73,7 @@ The document deliberately exercises:
 | **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |
 | **Images** | ✅ | ✅ | embedded from the `<img>` data URI, sized from the layout |
 | **Math** | ✅ | ❌ | MathML not converted |
-| **Footnotes** | ✅ | ❌ | no footnote part / references |
+| **Footnotes** | ✅ | ✅ | endnotes section → `word/footnotes.xml` + `w:footnoteReference` (content formatting is plain) |
 | **Hyperlinks** | ✅ | ✅ | external `http(s)` links → `w:hyperlink` + external rel (internal/TOC links not yet) |
 
 Bold entries are the current known gaps surfaced by this benchmark.

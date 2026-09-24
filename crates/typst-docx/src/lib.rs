@@ -73,7 +73,7 @@ pub fn docx(
         .unwrap_or((0.0, 450.0));
     let content_width_pt = content_right - content_left;
 
-    let mut em = Emitter::new(&body_runs, content_width_pt, false, body_images);
+    let mut em = Emitter::new(&body_runs, content_width_pt, false, body_images, collect_footnotes(document.root()));
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
             em.block(child);
@@ -126,6 +126,7 @@ pub fn docx(
         footer.as_deref(),
         &em.images,
         &em.hyperlinks,
+        &em.footnotes,
     )
 }
 
@@ -140,7 +141,7 @@ fn region_from_html(
 ) -> Option<String> {
     let el = find_element(root, tag_name)?;
     let is_footer = tag_name == tag::footer;
-    let mut em = Emitter::new(runs, content_width_pt, is_footer, images);
+    let mut em = Emitter::new(runs, content_width_pt, is_footer, images, Vec::new());
     for child in &el.children {
         em.block(child);
     }
@@ -152,6 +153,94 @@ fn region_from_html(
          {}</{root_name}>",
         em.out
     ))
+}
+
+/// Collect footnotes from the HTML endnotes section.
+fn collect_footnotes(root: &HtmlElement) -> Vec<Footnote> {
+    let mut footnotes = Vec::new();
+    collect_endnotes(root, &mut footnotes);
+    footnotes
+}
+
+fn collect_endnotes(el: &HtmlElement, footnotes: &mut Vec<Footnote>) {
+    if el.attrs.get(attr::role).map(|r| r.as_str()) == Some("doc-endnotes") {
+        collect_endnote_items(el, footnotes);
+        return;
+    }
+    for child in &el.children {
+        if let HtmlNode::Element(child) = child {
+            collect_endnotes(child, footnotes);
+        }
+    }
+}
+
+fn collect_endnote_items(el: &HtmlElement, footnotes: &mut Vec<Footnote>) {
+    for child in &el.children {
+        let HtmlNode::Element(child) = child else { continue };
+        if child.tag == tag::li {
+            let id = element_number(child).unwrap_or(footnotes.len() as u32 + 1);
+            let mut runs = Vec::new();
+            for grand in &child.children {
+                if let HtmlNode::Element(g) = grand {
+                    if g.attrs.get(attr::role).map(|r| r.as_str()) == Some("doc-backlink") {
+                        continue;
+                    }
+                }
+                collect_inline(grand, false, false, false, None, &mut runs);
+            }
+            footnotes.push(Footnote { id, runs });
+        } else {
+            collect_endnote_items(child, footnotes);
+        }
+    }
+}
+
+/// Build the `word/footnotes.xml` part.
+fn footnotes_xml(footnotes: &[Footnote]) -> String {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:footnotes xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+         <w:footnote w:type=\"separator\" w:id=\"-1\"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>\
+         <w:footnote w:type=\"continuationSeparator\" w:id=\"0\"><w:p><w:r>\
+         <w:continuationSeparator/></w:r></w:p></w:footnote>",
+    );
+    for footnote in footnotes {
+        out.push_str(&format!(
+            "<w:footnote w:id=\"{}\"><w:p><w:pPr>\
+             <w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
+             <w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr><w:footnoteRef/></w:r>",
+            footnote.id
+        ));
+        for run in &footnote.runs {
+            out.push_str(&footnote_run(run));
+        }
+        out.push_str("</w:p></w:footnote>");
+    }
+    out.push_str("</w:footnotes>");
+    out
+}
+
+/// Format a footnote run (bold/italic only; no layout typography).
+fn footnote_run(run: &Run) -> String {
+    if run.br {
+        return "<w:r><w:br/></w:r>".to_string();
+    }
+    let mut out = String::from("<w:r>");
+    if run.bold || run.italic {
+        out.push_str("<w:rPr>");
+        if run.bold {
+            out.push_str("<w:b/>");
+        }
+        if run.italic {
+            out.push_str("<w:i/>");
+        }
+        out.push_str("</w:rPr>");
+    }
+    out.push_str(&format!(
+        "<w:t xml:space=\"preserve\">{}</w:t></w:r>",
+        escape_xml(&run.text)
+    ));
+    out
 }
 
 /// Find the first descendant element with the given tag.
@@ -194,6 +283,8 @@ struct Run {
     br: bool,
     /// The external URL this run links to, if any.
     href: Option<String>,
+    /// The footnote id this run references, if any.
+    footnote_ref: Option<u32>,
 }
 
 /// Typography measured from the paged layout for a given Word style.
@@ -237,6 +328,12 @@ struct Media {
     content_type: String,
 }
 
+/// A footnote's content.
+struct Footnote {
+    id: u32,
+    runs: Vec<Run>,
+}
+
 /// Accumulates the document body XML.
 struct Emitter<'a> {
     out: String,
@@ -275,6 +372,8 @@ struct Emitter<'a> {
     images: Vec<Media>,
     /// External hyperlink targets, in order of first use.
     hyperlinks: Vec<String>,
+    /// Footnotes, referenced by id from the body.
+    footnotes: Vec<Footnote>,
 }
 
 impl Emitter<'_> {
@@ -284,6 +383,7 @@ impl Emitter<'_> {
         content_width_pt: f64,
         is_footer: bool,
         layout_images: Vec<layout::ImageInfo>,
+        footnotes: Vec<Footnote>,
     ) -> Emitter<'_> {
         Emitter {
             out: String::new(),
@@ -304,6 +404,7 @@ impl Emitter<'_> {
             image_cursor: 0,
             images: Vec::new(),
             hyperlinks: Vec::new(),
+            footnotes,
         }
     }
 
@@ -329,6 +430,7 @@ impl Emitter<'_> {
                         mono: false,
                         br: false,
                         href: None,
+                        footnote_ref: None,
                     }];
                     self.paragraph("Normal", &runs, None);
                 }
@@ -542,6 +644,13 @@ impl Emitter<'_> {
             self.out.push_str("<w:r><w:br/></w:r>");
             return;
         }
+        if let Some(id) = run.footnote_ref {
+            self.out.push_str(&format!(
+                "<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>\
+                 <w:footnoteReference w:id=\"{id}\"/></w:r>"
+            ));
+            return;
+        }
         // A digits-only run in a footer is the page number: emit a PAGE field
         // so it updates on every page instead of repeating the literal.
         if self.is_footer {
@@ -650,6 +759,7 @@ impl Emitter<'_> {
                     mono: false,
                     br: false,
                     href: None,
+                    footnote_ref: None,
                 }];
             }
             self.paragraph("ListParagraph", &runs, Some((num_id, level.min(8))));
@@ -903,11 +1013,29 @@ fn collect_inline(
                     mono,
                     br: false,
                     href: href.map(str::to_string),
+                    footnote_ref: None,
                 });
             }
         }
         HtmlNode::Element(el) => {
             let t = el.tag;
+            // A footnote reference marker.
+            if t == tag::sup
+                && el.attrs.get(attr::role).map(|r| r.as_str()) == Some("doc-noteref")
+            {
+                if let Some(id) = element_number(el) {
+                    runs.push(Run {
+                        text: String::new(),
+                        bold: false,
+                        italic: false,
+                        mono: false,
+                        br: false,
+                        href: None,
+                        footnote_ref: Some(id),
+                    });
+                }
+                return;
+            }
             let (b, i, m) = if t == tag::strong || t == tag::b {
                 (true, italic, mono)
             } else if t == tag::em || t == tag::i {
@@ -922,6 +1050,7 @@ fn collect_inline(
                     mono,
                     br: true,
                     href: None,
+                    footnote_ref: None,
                 });
                 return;
             } else {
@@ -1038,6 +1167,23 @@ fn resolve_tracks(
         .collect();
 
     (widths, (gap * 20.0).round() as i64)
+}
+
+/// The first number in an element's descendant link text.
+fn element_number(el: &HtmlElement) -> Option<u32> {
+    for child in &el.children {
+        if let HtmlNode::Element(child) = child {
+            if child.tag == tag::a {
+                if let Ok(number) = text_of(child).trim().parse::<u32>() {
+                    return Some(number);
+                }
+            }
+            if let Some(number) = element_number(child) {
+                return Some(number);
+            }
+        }
+    }
+    None
 }
 
 /// The concatenated text of an element.
@@ -1419,6 +1565,7 @@ fn package(
     footer: Option<&str>,
     images: &[Media],
     hyperlinks: &[String],
+    footnotes: &[Footnote],
 ) -> StrResult<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
@@ -1438,7 +1585,7 @@ fn package(
     write(
         &mut zip,
         "[Content_Types].xml",
-        &content_types(header.is_some(), footer.is_some(), images),
+        &content_types(header.is_some(), footer.is_some(), images, !footnotes.is_empty()),
     )?;
     write(&mut zip, "_rels/.rels", ROOT_RELS)?;
     write(&mut zip, "word/document.xml", document_xml)?;
@@ -1447,13 +1594,16 @@ fn package(
     write(
         &mut zip,
         "word/_rels/document.xml.rels",
-        &document_rels(header.is_some(), footer.is_some(), images, hyperlinks),
+        &document_rels(header.is_some(), footer.is_some(), images, hyperlinks, !footnotes.is_empty()),
     )?;
     if let Some(header) = header {
         write(&mut zip, "word/header1.xml", header)?;
     }
     if let Some(footer) = footer {
         write(&mut zip, "word/footer1.xml", footer)?;
+    }
+    if !footnotes.is_empty() {
+        write(&mut zip, "word/footnotes.xml", &footnotes_xml(footnotes))?;
     }
     for media in images {
         zip.start_file(format!("word/media/{}", media.name), opts)
@@ -1473,7 +1623,7 @@ const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
 </Relationships>"#;
 
 /// The `[Content_Types].xml` part, including header/footer and image overrides.
-fn content_types(header: bool, footer: bool, images: &[Media]) -> String {
+fn content_types(header: bool, footer: bool, images: &[Media], footnotes: bool) -> String {
     let mut out = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -1488,6 +1638,9 @@ fn content_types(header: bool, footer: bool, images: &[Media]) -> String {
     }
     if footer {
         out.push_str("<Override PartName=\"/word/footer1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
+    }
+    if footnotes {
+        out.push_str("<Override PartName=\"/word/footnotes.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml\"/>");
     }
     let mut seen: Vec<&str> = Vec::new();
     for media in images {
@@ -1509,6 +1662,7 @@ fn document_rels(
     footer: bool,
     images: &[Media],
     hyperlinks: &[String],
+    footnotes: bool,
 ) -> String {
     let mut out = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -1521,6 +1675,9 @@ fn document_rels(
     }
     if footer {
         out.push_str("<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>");
+    }
+    if footnotes {
+        out.push_str("<Relationship Id=\"rId5\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes\" Target=\"footnotes.xml\"/>");
     }
     for media in images {
         out.push_str(&format!(
