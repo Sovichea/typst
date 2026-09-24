@@ -18,6 +18,7 @@ typst-library = { workspace = true }
 typst-layout = { workspace = true }
 ecow = { workspace = true }
 zip = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true

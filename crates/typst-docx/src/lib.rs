@@ -5,6 +5,7 @@
 //! tables. This is the "semantic" half of the dual semantic+layout pipeline;
 //! geometry refinement from the paged layout is future work.
 
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
@@ -46,6 +47,23 @@ pub fn docx(
         .cloned()
         .collect();
 
+    let all_images = layout.map(layout::collect_images).unwrap_or_default();
+    let body_images: Vec<layout::ImageInfo> = all_images
+        .iter()
+        .filter(|image| image.region == layout::PageRegion::Body)
+        .cloned()
+        .collect();
+    let header_images: Vec<layout::ImageInfo> = all_images
+        .iter()
+        .filter(|image| image.region == layout::PageRegion::Header && image.page == 1)
+        .cloned()
+        .collect();
+    let footer_images: Vec<layout::ImageInfo> = all_images
+        .iter()
+        .filter(|image| image.region == layout::PageRegion::Footer && image.page == 1)
+        .cloned()
+        .collect();
+
     let (content_left, content_right) = layout
         .and_then(|doc| doc.pages().first())
         .map(|page| {
@@ -55,7 +73,7 @@ pub fn docx(
         .unwrap_or((0.0, 450.0));
     let content_width_pt = content_right - content_left;
 
-    let mut em = Emitter::new(&body_runs, content_width_pt, false);
+    let mut em = Emitter::new(&body_runs, content_width_pt, false, body_images);
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
             em.block(child);
@@ -69,8 +87,20 @@ pub fn docx(
     // The page header/footer are emitted structurally by the HTML export (grids,
     // rules, alignment); their typography is recovered from the layout runs in
     // that region.
-    let header = region_from_html(document.root(), tag::header, &header_runs, content_width_pt);
-    let footer = region_from_html(document.root(), tag::footer, &footer_runs, content_width_pt);
+    let header = region_from_html(
+        document.root(),
+        tag::header,
+        &header_runs,
+        content_width_pt,
+        header_images,
+    );
+    let footer = region_from_html(
+        document.root(),
+        tag::footer,
+        &footer_runs,
+        content_width_pt,
+        footer_images,
+    );
     let (header_dist, footer_dist) = header_footer_distances(&all, layout);
 
     let document_xml = format!(
@@ -94,6 +124,7 @@ pub fn docx(
         ),
         header.as_deref(),
         footer.as_deref(),
+        &em.images,
     )
 }
 
@@ -104,10 +135,11 @@ fn region_from_html(
     tag_name: HtmlTag,
     runs: &[layout::Run],
     content_width_pt: f64,
+    images: Vec<layout::ImageInfo>,
 ) -> Option<String> {
     let el = find_element(root, tag_name)?;
     let is_footer = tag_name == tag::footer;
-    let mut em = Emitter::new(runs, content_width_pt, is_footer);
+    let mut em = Emitter::new(runs, content_width_pt, is_footer, images);
     for child in &el.children {
         em.block(child);
     }
@@ -193,6 +225,15 @@ struct Block {
     text: String,
 }
 
+/// An embedded image part.
+struct Media {
+    rel_id: String,
+    name: String,
+    data: Vec<u8>,
+    ext: String,
+    content_type: String,
+}
+
 /// Accumulates the document body XML.
 struct Emitter<'a> {
     out: String,
@@ -223,11 +264,22 @@ struct Emitter<'a> {
     /// Whether this emitter is building a footer (so a digits-only run becomes
     /// a `PAGE` field).
     is_footer: bool,
+    /// Placed images, for sizing an `<img>` (in document order).
+    layout_images: Vec<layout::ImageInfo>,
+    /// Next unconsumed layout image.
+    image_cursor: usize,
+    /// Embedded image parts collected while emitting.
+    images: Vec<Media>,
 }
 
 impl Emitter<'_> {
     /// Create an emitter over the given layout runs.
-    fn new(runs: &[layout::Run], content_width_pt: f64, is_footer: bool) -> Emitter<'_> {
+    fn new(
+        runs: &[layout::Run],
+        content_width_pt: f64,
+        is_footer: bool,
+        layout_images: Vec<layout::ImageInfo>,
+    ) -> Emitter<'_> {
         Emitter {
             out: String::new(),
             runs,
@@ -243,6 +295,9 @@ impl Emitter<'_> {
             last_y: 0.0,
             content_width_pt,
             is_footer,
+            layout_images,
+            image_cursor: 0,
+            images: Vec::new(),
         }
     }
 
@@ -314,6 +369,8 @@ impl Emitter<'_> {
             }
         } else if t == tag::table {
             self.table(el);
+        } else if t == tag::img {
+            self.image(el);
         } else if t == tag::header || t == tag::footer {
             // Written to the DOCX header/footer parts separately.
         } else if t == tag::hr {
@@ -631,6 +688,55 @@ impl Emitter<'_> {
             .map(|run| run.width_pt)
     }
 
+    /// Emit an `<img>` as an inline drawing, embedding the image data.
+    fn image(&mut self, el: &HtmlElement) {
+        let Some(src) = el.attrs.get(attr::src) else { return };
+        let Some((mime, data)) = parse_data_uri(src) else { return };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+            return;
+        };
+
+        let ext = mime_to_ext(mime);
+        let index = self.images.len() + 1;
+        let rel_id = format!("rId{}", 100 + index);
+        self.images.push(Media {
+            rel_id: rel_id.clone(),
+            name: format!("image{index}.{ext}"),
+            data: bytes,
+            ext: ext.to_string(),
+            content_type: mime.to_string(),
+        });
+
+        let (width, height) = self
+            .layout_images
+            .get(self.image_cursor)
+            .map(|image| (image.width_pt, image.height_pt))
+            .unwrap_or((100.0, 100.0));
+        self.image_cursor += 1;
+        let cx = (width * 12700.0).round() as i64;
+        let cy = (height * 12700.0).round() as i64;
+
+        self.out.push_str(&format!(
+            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" \
+             w:lineRule=\"auto\"/></w:pPr>\
+             <w:r><w:drawing><wp:inline \
+             xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
+             distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
+             <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
+             <wp:docPr id=\"{index}\" name=\"Picture {index}\"/>\
+             <a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+             <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+             <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+             <pic:nvPicPr><pic:cNvPr id=\"{index}\" name=\"Picture {index}\"/>\
+             <pic:cNvPicPr/></pic:nvPicPr>\
+             <pic:blipFill><a:blip r:embed=\"{rel_id}\"/>\
+             <a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
+             <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+             <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>\
+             </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+        ));
+    }
+
     fn table(&mut self, el: &HtmlElement) {
         let mut rows: Vec<&HtmlElement> = Vec::new();
         collect_rows(el, &mut rows);
@@ -800,7 +906,7 @@ fn has_block_child(el: &HtmlElement) -> bool {
             tag::p | tag::div | tag::section | tag::table | tag::ul | tag::ol | tag::li
                 | tag::h1 | tag::h2 | tag::h3 | tag::h4 | tag::h5 | tag::h6
                 | tag::figure | tag::blockquote | tag::pre | tag::hr
-                | tag::header | tag::footer
+                | tag::header | tag::footer | tag::img | tag::figcaption
         ))
     })
 }
@@ -915,6 +1021,29 @@ fn text_len(el: &HtmlElement) -> usize {
         }
     }
     count
+}
+
+/// Parse a `data:<mime>;base64,<data>` URI into (mime, base64 data).
+fn parse_data_uri(src: &str) -> Option<(&str, &str)> {
+    let rest = src.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if !meta.contains("base64") {
+        return None;
+    }
+    Some((meta.split(';').next()?, data))
+}
+
+/// Map an image MIME type to a file extension.
+fn mime_to_ext(mime: &str) -> &str {
+    match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "image/svg+xml" => "svg",
+        "image/webp" => "webp",
+        _ => "png",
+    }
 }
 
 /// Parse a `border-top-width`/`border-top-color` style into (thickness pt, color).
@@ -1241,6 +1370,7 @@ fn package(
     numbering: &str,
     header: Option<&str>,
     footer: Option<&str>,
+    images: &[Media],
 ) -> StrResult<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
@@ -1257,7 +1387,11 @@ fn package(
         Ok(())
     };
 
-    write(&mut zip, "[Content_Types].xml", &content_types(header.is_some(), footer.is_some()))?;
+    write(
+        &mut zip,
+        "[Content_Types].xml",
+        &content_types(header.is_some(), footer.is_some(), images),
+    )?;
     write(&mut zip, "_rels/.rels", ROOT_RELS)?;
     write(&mut zip, "word/document.xml", document_xml)?;
     write(&mut zip, "word/styles.xml", styles)?;
@@ -1265,13 +1399,19 @@ fn package(
     write(
         &mut zip,
         "word/_rels/document.xml.rels",
-        &document_rels(header.is_some(), footer.is_some()),
+        &document_rels(header.is_some(), footer.is_some(), images),
     )?;
     if let Some(header) = header {
         write(&mut zip, "word/header1.xml", header)?;
     }
     if let Some(footer) = footer {
         write(&mut zip, "word/footer1.xml", footer)?;
+    }
+    for media in images {
+        zip.start_file(format!("word/media/{}", media.name), opts)
+            .map_err(|e| eco_format!("zip error: {e}"))?;
+        zip.write_all(&media.data)
+            .map_err(|e| eco_format!("zip write error: {e}"))?;
     }
 
     let cursor = zip.finish().map_err(|e| eco_format!("zip finish error: {e}"))?;
@@ -1284,8 +1424,8 @@ const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>"#;
 
-/// The `[Content_Types].xml` part, including header/footer overrides.
-fn content_types(header: bool, footer: bool) -> String {
+/// The `[Content_Types].xml` part, including header/footer and image overrides.
+fn content_types(header: bool, footer: bool, images: &[Media]) -> String {
     let mut out = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -1301,12 +1441,22 @@ fn content_types(header: bool, footer: bool) -> String {
     if footer {
         out.push_str("<Override PartName=\"/word/footer1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>");
     }
+    let mut seen: Vec<&str> = Vec::new();
+    for media in images {
+        if !seen.contains(&media.ext.as_str()) {
+            seen.push(&media.ext);
+            out.push_str(&format!(
+                "<Default Extension=\"{}\" ContentType=\"{}\"/>",
+                media.ext, media.content_type
+            ));
+        }
+    }
     out.push_str("</Types>");
     out
 }
 
-/// The document relationships, including header/footer parts.
-fn document_rels(header: bool, footer: bool) -> String {
+/// The document relationships, including header/footer and image parts.
+fn document_rels(header: bool, footer: bool, images: &[Media]) -> String {
     let mut out = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -1318,6 +1468,12 @@ fn document_rels(header: bool, footer: bool) -> String {
     }
     if footer {
         out.push_str("<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>");
+    }
+    for media in images {
+        out.push_str(&format!(
+            "<Relationship Id=\"{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/{}\"/>",
+            media.rel_id, media.name
+        ));
     }
     out.push_str("</Relationships>");
     out

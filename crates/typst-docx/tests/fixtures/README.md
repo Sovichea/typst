@@ -71,7 +71,7 @@ The document deliberately exercises:
 | Outline (TOC) | ✅ | ✅ | rendered as plain indented paragraphs (no Word numbering — the numbers are already in the text) |
 | **Multi-line headings / letterheads** | ✅ | ✅ | `<br>` → `<w:br/>`, inline size/color, `#align` → centered |
 | **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |
-| **Images** | ✅ | ❌ | `FrameItem::Image` / `<img>` not emitted |
+| **Images** | ✅ | ✅ | embedded from the `<img>` data URI, sized from the layout |
 | **Math** | ✅ | ❌ | MathML not converted |
 | **Footnotes** | ✅ | ❌ | no footnote part / references |
 | **Hyperlinks** | ✅ | ❌ | `<a>` not converted |

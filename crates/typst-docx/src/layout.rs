@@ -98,6 +98,53 @@ pub fn collect_runs(document: &PagedDocument) -> Vec<Run> {
     runs
 }
 
+/// An image placed in the layout.
+#[derive(Clone, Debug)]
+pub struct ImageInfo {
+    /// The image's left edge, in points.
+    pub x_pt: f64,
+    /// The image's top edge, in points.
+    pub y_pt: f64,
+    /// The image's width, in points.
+    pub width_pt: f64,
+    /// The image's height, in points.
+    pub height_pt: f64,
+    /// The 1-based page number.
+    pub page: u64,
+    /// Which page region the image belongs to.
+    pub region: PageRegion,
+}
+
+/// Collect every placed image in the document.
+pub fn collect_images(document: &PagedDocument) -> Vec<ImageInfo> {
+    let mut images = Vec::new();
+    for (index, page) in document.pages().iter().enumerate() {
+        let height = page.frame.size().y.to_pt();
+        let top = page.margin.top.to_pt();
+        let bottom = page.margin.bottom.to_pt();
+
+        walk_items(&page.frame, Point::zero(), &mut |item, at| {
+            let FrameItem::Image(_, size, _) = item else { return };
+            let y_pt = at.y.to_pt();
+            images.push(ImageInfo {
+                x_pt: at.x.to_pt(),
+                y_pt,
+                width_pt: size.x.to_pt(),
+                height_pt: size.y.to_pt(),
+                page: index as u64 + 1,
+                region: if y_pt < top {
+                    PageRegion::Header
+                } else if y_pt > height - bottom {
+                    PageRegion::Footer
+                } else {
+                    PageRegion::Body
+                },
+            });
+        });
+    }
+    images
+}
+
 /// A horizontal rule (a stroked line) measured from the layout.
 #[derive(Clone, Debug)]
 pub struct Rule {
