@@ -117,6 +117,7 @@ impl CompileConfig {
                 Some(ext) if ext.eq_ignore_ascii_case("svg") => OutputFormat::Svg,
                 Some(ext) if ext.eq_ignore_ascii_case("html") => OutputFormat::Html,
                 Some(ext) if ext.eq_ignore_ascii_case("docx") => OutputFormat::Docx,
+                Some(ext) if ext.eq_ignore_ascii_case("json") => OutputFormat::Layout,
                 _ => bail!(
                     "could not infer output format for path {}.\n\
                      consider providing the format manually with `--format/-f`",
@@ -139,6 +140,7 @@ impl CompileConfig {
                     OutputFormat::Html => "html",
                     OutputFormat::Bundle => "",
                     OutputFormat::Docx => "docx",
+                    OutputFormat::Layout => "json",
                 },
             ))
         });
@@ -347,7 +349,29 @@ fn compile_and_export(
             let result = output.and_then(|bundle| export_bundle(bundle, config));
             Warned { output: result, warnings }
         }
+        OutputFormat::Layout => {
+            let Warned { output, warnings } = typst::compile::<PagedDocument>(world);
+            let result = output.and_then(|document| export_layout(&document, world, config));
+            Warned {
+                output: result.map(|()| vec![config.output.clone()]),
+                warnings,
+            }
+        }
     }
+}
+
+/// Export the compiler-native layout geometry as JSON.
+fn export_layout(
+    document: &PagedDocument,
+    world: &SystemWorld,
+    config: &CompileConfig,
+) -> SourceResult<()> {
+    let json = typst_docx::layout_json(world, document);
+    config
+        .output
+        .write(json.as_bytes())
+        .map_err(|err| eco_format!("failed to write layout JSON file ({err})"))
+        .at(Span::detached())
 }
 
 /// Export to DOCX.
@@ -391,7 +415,9 @@ fn export_paged(
         OutputFormat::Svg => {
             export_image(document, config, ImageExportFormat::Svg).at(Span::detached())
         }
-        OutputFormat::Html | OutputFormat::Bundle | OutputFormat::Docx => unreachable!(),
+        OutputFormat::Html | OutputFormat::Bundle | OutputFormat::Docx | OutputFormat::Layout => {
+            unreachable!()
+        }
     }
 }
 

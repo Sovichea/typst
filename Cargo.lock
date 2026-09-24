@@ -3273,6 +3273,7 @@ version = "0.15.1"
 dependencies = [
  "ecow",
  "typst-html",
+ "typst-layout",
  "typst-library",
  "zip",
 ]

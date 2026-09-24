@@ -13,6 +13,10 @@ use typst_library::diag::StrResult;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+pub mod layout;
+
+pub use layout::layout_json;
+
 /// Convert a Typst HTML document into DOCX bytes.
 pub fn docx(document: &HtmlDocument) -> StrResult<Vec<u8>> {
     let mut em = Emitter { out: String::new() };
