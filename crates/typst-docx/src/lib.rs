@@ -43,6 +43,9 @@ pub fn docx(
         blocks: Vec::new(),
         cursor: 0,
         align: None,
+        next_num_id: 100,
+        ordered_num_ids: Vec::new(),
+        indent: None,
     };
 
     if let Some(body) = find_body(document.root()) {
@@ -70,7 +73,19 @@ pub fn docx(
         sect_pr(layout, header.is_some(), footer.is_some())
     );
 
-    package(&document_xml, &styles(&measured), header.as_deref(), footer.as_deref())
+    package(
+        &document_xml,
+        &styles(&measured),
+        &numbering(
+            &em.ordered_num_ids,
+            measured
+                .get("ListParagraph")
+                .map(|m| (m.indent_pt * 20.0).round() as i64)
+                .unwrap_or(720),
+        ),
+        header.as_deref(),
+        footer.as_deref(),
+    )
 }
 
 fn find_body(el: &HtmlElement) -> Option<&HtmlElement> {
@@ -143,6 +158,12 @@ struct Emitter<'a> {
     /// The current paragraph alignment (`w:jc` value), set while recursing into
     /// an aligned container.
     align: Option<String>,
+    /// Next numbering id handed out to a new ordered list.
+    next_num_id: u32,
+    /// Ordered-list numbering ids that were handed out.
+    ordered_num_ids: Vec<u32>,
+    /// Direct left indent (twips) for the next paragraph, if any.
+    indent: Option<i64>,
 }
 
 impl Emitter<'_> {
@@ -200,9 +221,18 @@ impl Emitter<'_> {
             let runs = inline(&el.children, false, true, false);
             self.paragraph("Caption", &runs, None);
         } else if t == tag::ul {
-            self.list(el, false, 0);
+            if list_style_none(el) {
+                self.plain_list(el, 0);
+            } else {
+                self.list(el, false, 1, 0);
+            }
         } else if t == tag::ol {
-            self.list(el, true, 0);
+            if list_style_none(el) {
+                self.plain_list(el, 0);
+            } else {
+                let num_id = self.alloc_num_id();
+                self.list(el, true, num_id, 0);
+            }
         } else if t == tag::table {
             self.table(el);
         } else if t == tag::hr {
@@ -234,6 +264,8 @@ impl Emitter<'_> {
             self.out.push_str(&format!(
                 "<w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/></w:numPr>"
             ));
+        } else if let Some(indent) = self.indent {
+            self.out.push_str(&format!("<w:ind w:left=\"{indent}\"/>"));
         }
         if let Some(align) = self.align.clone() {
             self.out.push_str(&format!("<w:jc w:val=\"{align}\"/>"));
@@ -353,8 +385,9 @@ impl Emitter<'_> {
         self.out.push_str("</w:t></w:r>");
     }
 
-    fn list(&mut self, el: &HtmlElement, ordered: bool, level: u32) {
-        let num_id = if ordered { 2 } else { 1 };
+    /// Emit a list, recursing into nested lists. `ordered` selects whether a
+    /// nested list continues this list's numbering or starts its own.
+    fn list(&mut self, el: &HtmlElement, ordered: bool, num_id: u32, level: u32) {
         for child in &el.children {
             let HtmlNode::Element(li) = child else { continue };
             if li.tag != tag::li {
@@ -385,13 +418,52 @@ impl Emitter<'_> {
             for grand in &li.children {
                 if let HtmlNode::Element(g) = grand {
                     if g.tag == tag::ul {
-                        self.list(g, false, level + 1);
+                        self.list(g, false, 1, level + 1);
                     } else if g.tag == tag::ol {
-                        self.list(g, true, level + 1);
+                        let nested = if ordered { num_id } else { self.alloc_num_id() };
+                        self.list(g, true, nested, level + 1);
                     }
                 }
             }
         }
+    }
+
+    /// Emit a list whose HTML carries no markers (e.g. an outline), as plain
+    /// indented paragraphs without Word numbering.
+    fn plain_list(&mut self, el: &HtmlElement, level: u32) {
+        for child in &el.children {
+            let HtmlNode::Element(li) = child else { continue };
+            if li.tag != tag::li {
+                continue;
+            }
+            let mut runs = Vec::new();
+            for grand in &li.children {
+                match grand {
+                    HtmlNode::Element(g) if g.tag == tag::ul || g.tag == tag::ol => {}
+                    _ => collect_inline(grand, false, false, false, &mut runs),
+                }
+            }
+            self.indent = Some(360 * (level as i64 + 1));
+            self.paragraph("ListParagraph", &runs, None);
+            self.indent = None;
+
+            for grand in &li.children {
+                if let HtmlNode::Element(g) = grand {
+                    if g.tag == tag::ul || g.tag == tag::ol {
+                        self.plain_list(g, level + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Allocate a fresh numbering id for a new ordered list so its counter
+    /// restarts at 1.
+    fn alloc_num_id(&mut self) -> u32 {
+        let id = self.next_num_id;
+        self.next_num_id += 1;
+        self.ordered_num_ids.push(id);
+        id
     }
 
     fn table(&mut self, el: &HtmlElement) {
@@ -522,6 +594,18 @@ fn collect_inline(
     }
 }
 
+/// Whether a list element requests no markers (`list-style-type: none`).
+fn list_style_none(el: &HtmlElement) -> bool {
+    el.attrs
+        .get(attr::style)
+        .map(|style| {
+            style
+                .split(';')
+                .any(|d| d.replace(' ', "").starts_with("list-style-type:none"))
+        })
+        .unwrap_or(false)
+}
+
 /// Map a CSS `text-align` declaration to a Word `w:jc` value.
 fn parse_text_align(style: &str) -> Option<String> {
     for declaration in style.split(';') {
@@ -570,7 +654,11 @@ fn compute_spacing(
             let prefix: String = target.chars().take(24).collect();
             runs[cursor..]
                 .iter()
-                .position(|run| collapse(&run.text).starts_with(&prefix))
+                .position(|run| {
+                    let text = collapse(&run.text);
+                    !text.is_empty()
+                        && (text.starts_with(&prefix) || prefix.starts_with(&text))
+                })
                 .map(|offset| cursor + offset)
         };
         if let Some(first) = found {
@@ -886,6 +974,7 @@ fn run_text(run: &layout::Run, text: &str) -> String {
 fn package(
     document_xml: &str,
     styles: &str,
+    numbering: &str,
     header: Option<&str>,
     footer: Option<&str>,
 ) -> StrResult<Vec<u8>> {
@@ -908,7 +997,7 @@ fn package(
     write(&mut zip, "_rels/.rels", ROOT_RELS)?;
     write(&mut zip, "word/document.xml", document_xml)?;
     write(&mut zip, "word/styles.xml", styles)?;
-    write(&mut zip, "word/numbering.xml", NUMBERING)?;
+    write(&mut zip, "word/numbering.xml", numbering)?;
     write(
         &mut zip,
         "word/_rels/document.xml.rels",
@@ -1078,15 +1167,22 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
         );
     }
 
-    let indent_patches: [(&str, &str); 2] = [
-        ("Quote", "<w:ind w:left=\"567\"/>"),
-        ("ListParagraph", "<w:ind w:left=\"720\"/>"),
-    ];
-    for (style, anchor) in indent_patches {
-        if let Some(m) = measured.get(style) {
-            let left = (m.indent_pt * 20.0).round() as i64;
-            s = s.replace(anchor, &format!("<w:ind w:left=\"{left}\"/>"));
-        }
+    if let Some(m) = measured.get("Quote") {
+        let left = (m.indent_pt * 20.0).round() as i64;
+        s = s.replace(
+            "<w:ind w:left=\"567\"/>",
+            &format!("<w:ind w:left=\"{left}\"/>"),
+        );
+    }
+
+    // List paragraphs: measured space-below and line pitch, plus the indent
+    // (the numbering definition overrides the indent for numbered lists).
+    if let Some(m) = measured.get("ListParagraph") {
+        let left = (m.indent_pt * 20.0).round().max(0.0) as i64;
+        s = s.replace(
+            "<w:pPr><w:ind w:left=\"720\"/></w:pPr>",
+            &format!("<w:pPr>{}<w:ind w:left=\"{left}\"/></w:pPr>", spacing(m)),
+        );
     }
 
     s
@@ -1147,18 +1243,43 @@ const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 </w:tblBorders></w:tblPr></w:style>
 </w:styles>"#;
 
-const NUMBERING: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:abstractNum w:abstractNumId="0">
-<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>
-<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="◦"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr></w:lvl>
-<w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="▪"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="2160" w:hanging="360"/></w:pPr></w:lvl>
-</w:abstractNum>
-<w:abstractNum w:abstractNumId="1">
-<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>
-<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2."/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr></w:lvl>
-<w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="lowerRoman"/><w:lvlText w:val="%3."/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="2160" w:hanging="360"/></w:pPr></w:lvl>
-</w:abstractNum>
-<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
-<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
-</w:numbering>"#;
+/// The `numbering.xml` part: a bullet list, a decimal list, and one restarting
+/// `w:num` per ordered-list instance so each list starts at 1. `indent` is the
+/// measured level-0 indent in twips.
+fn numbering(ordered_num_ids: &[u32], indent: i64) -> String {
+    let indent = indent.max(0);
+    let lvl = |ilvl: i64, fmt: &str, text: &str| {
+        format!(
+            "<w:lvl w:ilvl=\"{ilvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"{fmt}\"/>\
+             <w:lvlText w:val=\"{text}\"/><w:lvlJc w:val=\"left\"/>\
+             <w:pPr><w:ind w:left=\"{}\" w:hanging=\"{indent}\"/></w:pPr></w:lvl>",
+            indent * (ilvl + 1)
+        )
+    };
+
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+         <w:abstractNum w:abstractNumId=\"0\">",
+    );
+    out.push_str(&lvl(0, "bullet", "\u{2022}"));
+    out.push_str(&lvl(1, "bullet", "\u{25e6}"));
+    out.push_str(&lvl(2, "bullet", "\u{25aa}"));
+    out.push_str("</w:abstractNum><w:abstractNum w:abstractNumId=\"1\">");
+    out.push_str(&lvl(0, "decimal", "%1."));
+    out.push_str(&lvl(1, "lowerLetter", "%2."));
+    out.push_str(&lvl(2, "lowerRoman", "%3."));
+    out.push_str("</w:abstractNum><w:num w:numId=\"1\"><w:abstractNumId w:val=\"0\"/></w:num>");
+
+    for &id in ordered_num_ids {
+        out.push_str(&format!(
+            "<w:num w:numId=\"{id}\"><w:abstractNumId w:val=\"1\"/>\
+             <w:lvlOverride w:ilvl=\"0\"><w:startOverride w:val=\"1\"/></w:lvlOverride>\
+             <w:lvlOverride w:ilvl=\"1\"><w:startOverride w:val=\"1\"/></w:lvlOverride>\
+             <w:lvlOverride w:ilvl=\"2\"><w:startOverride w:val=\"1\"/></w:lvlOverride>\
+             </w:num>"
+        ));
+    }
+    out.push_str("</w:numbering>");
+    out
+}

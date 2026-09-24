@@ -67,7 +67,8 @@ The document deliberately exercises:
 | Page size & margins | ✅ | ✅ | from `#set page(...)` |
 | Block spacing & indent | ✅ | ✅ | space-below + left indent + line pitch (`w:line`, `atLeast`) |
 | Line pitch (intra-paragraph) | ✅ | ✅ | measured baseline-to-baseline; `atLeast` avoids clipping. Line *breaking* still follows Word |
-| Lists | ✅ | ✅ | bullets/numbers via numbering.xml |
+| Lists | ✅ | ✅ | numbered lists restart per list; measured indent; bullets/numbers via numbering.xml |
+| Outline (TOC) | ✅ | ✅ | rendered as plain indented paragraphs (no Word numbering — the numbers are already in the text) |
 | **Multi-line headings / letterheads** | ✅ | ✅ | `<br>` → `<w:br/>`, inline size/color, `#align` → centered |
 | **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |
 | **Images** | ✅ | ❌ | `FrameItem::Image` / `<img>` not emitted |
