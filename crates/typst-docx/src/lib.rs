@@ -36,6 +36,15 @@ pub fn docx(
         .cloned()
         .collect();
 
+    let rules = layout.map(layout::collect_rules).unwrap_or_default();
+    let mut body_rules: Vec<layout::Rule> = rules
+        .iter()
+        .filter(|rule| rule.region == layout::PageRegion::Body)
+        .cloned()
+        .collect();
+    body_rules
+        .sort_by(|a, b| a.y_pt.partial_cmp(&b.y_pt).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut em = Emitter {
         out: String::new(),
         runs: &body_runs,
@@ -46,6 +55,9 @@ pub fn docx(
         next_num_id: 100,
         ordered_num_ids: Vec::new(),
         indent: None,
+        body_rules,
+        rule_cursor: 0,
+        last_y: 0.0,
     };
 
     if let Some(body) = find_body(document.root()) {
@@ -53,6 +65,7 @@ pub fn docx(
             em.block(child);
         }
     }
+    em.flush_all_rules();
 
     let margin_left = layout
         .and_then(|doc| doc.pages().first())
@@ -69,8 +82,30 @@ pub fn docx(
         })
         .unwrap_or((0.0, 450.0));
 
-    let header = region_part(&all, layout::PageRegion::Header, "w:hdr", content_left, content_right);
-    let footer = region_part(&all, layout::PageRegion::Footer, "w:ftr", content_left, content_right);
+    let header_rules: Vec<&layout::Rule> = rules
+        .iter()
+        .filter(|rule| rule.region == layout::PageRegion::Header && rule.page == 1)
+        .collect();
+    let footer_rules: Vec<&layout::Rule> = rules
+        .iter()
+        .filter(|rule| rule.region == layout::PageRegion::Footer && rule.page == 1)
+        .collect();
+    let header = region_part(
+        &all,
+        &header_rules,
+        layout::PageRegion::Header,
+        "w:hdr",
+        content_left,
+        content_right,
+    );
+    let footer = region_part(
+        &all,
+        &footer_rules,
+        layout::PageRegion::Footer,
+        "w:ftr",
+        content_left,
+        content_right,
+    );
     let (header_dist, footer_dist) = header_footer_distances(&all, layout);
 
     let document_xml = format!(
@@ -173,6 +208,12 @@ struct Emitter<'a> {
     ordered_num_ids: Vec<u32>,
     /// Direct left indent (twips) for the next paragraph, if any.
     indent: Option<i64>,
+    /// Body horizontal rules, in document order.
+    body_rules: Vec<layout::Rule>,
+    /// Next unconsumed body rule.
+    rule_cursor: usize,
+    /// The y of the most recently matched block, for interleaving rules.
+    last_y: f64,
 }
 
 impl Emitter<'_> {
@@ -261,6 +302,7 @@ impl Emitter<'_> {
 
     fn paragraph(&mut self, style: &str, runs: &[Run], num: Option<(u32, u32)>) {
         let typos = self.measure_runs(runs);
+        self.flush_rules();
         self.record_sample(style, &typos);
         self.blocks.push(Block {
             style: style.to_string(),
@@ -314,6 +356,7 @@ impl Emitter<'_> {
     fn measure_runs(&mut self, runs: &[Run]) -> Vec<Option<Typography>> {
         let mut overrides = vec![None; runs.len()];
         let mut cursor = self.cursor;
+        let mut first_y: Option<f64> = None;
 
         for (index, run) in runs.iter().enumerate() {
             if run.br {
@@ -336,6 +379,9 @@ impl Emitter<'_> {
             if let Some(offset) = found {
                 let layout_run = &self.runs[cursor + offset];
                 cursor += offset + 1;
+                if first_y.is_none() {
+                    first_y = Some(layout_run.y_pt);
+                }
                 overrides[index] = Some(Typography {
                     family: layout_run.family.clone(),
                     size_pt: layout_run.size_pt,
@@ -346,8 +392,32 @@ impl Emitter<'_> {
             }
         }
 
+        if let Some(y) = first_y {
+            self.last_y = y;
+        }
         self.cursor = cursor;
         overrides
+    }
+
+    /// Emit any body rule that sits above the current block, so rules are
+    /// interleaved with the HTML-driven body in document order.
+    fn flush_rules(&mut self) {
+        while self.rule_cursor < self.body_rules.len()
+            && self.body_rules[self.rule_cursor].y_pt < self.last_y
+        {
+            let rule = self.body_rules[self.rule_cursor].clone();
+            self.out.push_str(&rule_paragraph(&rule, 0));
+            self.rule_cursor += 1;
+        }
+    }
+
+    /// Emit any body rules left after the last block.
+    fn flush_all_rules(&mut self) {
+        while self.rule_cursor < self.body_rules.len() {
+            let rule = self.body_rules[self.rule_cursor].clone();
+            self.out.push_str(&rule_paragraph(&rule, 0));
+            self.rule_cursor += 1;
+        }
     }
 
     fn run(&mut self, run: &Run, typo: Option<&Typography>) {
@@ -910,6 +980,7 @@ fn header_footer_distances(
 /// spaced by the measured gap to the next line.
 fn region_part(
     runs: &[layout::Run],
+    rules: &[&layout::Rule],
     region: layout::PageRegion,
     root: &str,
     content_left: f64,
@@ -919,9 +990,6 @@ fn region_part(
         .iter()
         .filter(|run| run.region == region && run.page == 1 && !run.text.trim().is_empty())
         .collect();
-    if lines.is_empty() {
-        return None;
-    }
     lines.sort_by(|a, b| {
         a.y_pt
             .partial_cmp(&b.y_pt)
@@ -937,46 +1005,81 @@ fn region_part(
         }
     }
 
+    // Merge text lines and horizontal rules into one top-to-bottom sequence.
+    enum Piece<'a> {
+        Line(&'a [&'a layout::Run]),
+        Rule(&'a layout::Rule),
+    }
+    let mut pieces: Vec<(f64, Piece)> = Vec::new();
+    for group in &groups {
+        pieces.push((group[0].y_pt, Piece::Line(group.as_slice())));
+    }
+    for &rule in rules {
+        pieces.push((rule.y_pt, Piece::Rule(rule)));
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    pieces.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let extent = |piece: &Piece| -> (f64, f64) {
+        match piece {
+            Piece::Line(group) => (
+                group.iter().map(|r| r.y_pt - r.ascent_pt).fold(f64::MAX, f64::min),
+                group.iter().map(|r| r.y_pt + r.descent_pt).fold(f64::MIN, f64::max),
+            ),
+            Piece::Rule(rule) => (
+                rule.y_pt - rule.thickness_pt / 2.0,
+                rule.y_pt + rule.thickness_pt / 2.0,
+            ),
+        }
+    };
+
     let mut body = String::new();
-    for (index, group) in groups.iter().enumerate() {
-        let after = match groups.get(index + 1) {
-            Some(next) => {
-                let top = next[0].y_pt - next[0].ascent_pt;
-                let bottom = group
-                    .iter()
-                    .map(|run| run.y_pt + run.descent_pt)
-                    .fold(f64::MIN, f64::max);
-                ((top - bottom).max(0.0) * 20.0).round() as i64
+    for (index, (_, piece)) in pieces.iter().enumerate() {
+        let after = match pieces.get(index + 1) {
+            Some((_, next)) => {
+                ((extent(next).0 - extent(piece).1).max(0.0) * 20.0).round() as i64
             }
             None => 0,
         };
 
-        // An exact line height from the glyph metrics: otherwise the paragraph
-        // inherits the body's line pitch and pads below the baseline.
-        let height = group
-            .iter()
-            .map(|run| run.ascent_pt + run.descent_pt)
-            .fold(0.0_f64, f64::max);
-        let line = ((height + 1.0) * 20.0).round() as i64;
+        match piece {
+            Piece::Rule(rule) => {
+                let rule: &layout::Rule = rule;
+                body.push_str(&rule_paragraph(rule, after));
+            }
+            Piece::Line(group) => {
+                let group: &[&layout::Run] = group;
+                // An exact line height from the glyph metrics: otherwise the
+                // paragraph inherits the body's line pitch and pads below the
+                // baseline.
+                let height = group
+                    .iter()
+                    .map(|run| run.ascent_pt + run.descent_pt)
+                    .fold(0.0_f64, f64::max);
+                let line = ((height + 1.0) * 20.0).round() as i64;
 
-        // A row whose runs sit apart (e.g. a left/right grid) becomes a
-        // borderless table with the grid's measured columns and inset.
-        let separated = group
-            .windows(2)
-            .any(|pair| pair[1].x_pt - (pair[0].x_pt + pair[0].width_pt) > 6.0);
-        if separated && group.len() > 1 {
-            body.push_str(&grid_row(group, content_left, content_right, line));
-            continue;
-        }
+                // A row whose runs sit apart (e.g. a left/right grid) becomes a
+                // borderless table with the grid's measured columns and inset.
+                let separated = group
+                    .windows(2)
+                    .any(|pair| pair[1].x_pt - (pair[0].x_pt + pair[0].width_pt) > 6.0);
+                if separated && group.len() > 1 {
+                    body.push_str(&grid_row(group, content_left, content_right, line));
+                    continue;
+                }
 
-        body.push_str(&format!(
-            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"{after}\" w:line=\"{line}\" \
-             w:lineRule=\"exact\"/></w:pPr>"
-        ));
-        for run in group {
-            body.push_str(&format_run(run));
+                body.push_str(&format!(
+                    "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"{after}\" \
+                     w:line=\"{line}\" w:lineRule=\"exact\"/></w:pPr>"
+                ));
+                for run in group.iter() {
+                    body.push_str(&format_run(run));
+                }
+                body.push_str("</w:p>");
+            }
         }
-        body.push_str("</w:p>");
     }
     Some(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -984,6 +1087,18 @@ fn region_part(
          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
          {body}</{root}>"
     ))
+}
+
+/// Render a horizontal rule as an empty paragraph with a bottom border.
+fn rule_paragraph(rule: &layout::Rule, after: i64) -> String {
+    let sz = (rule.thickness_pt * 8.0).round().clamp(2.0, 96.0) as i64;
+    format!(
+        "<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"{sz}\" w:space=\"0\" \
+         w:color=\"{color}\"/></w:pBdr>\
+         <w:spacing w:before=\"0\" w:after=\"{after}\" w:line=\"20\" w:lineRule=\"exact\"/>\
+         </w:pPr></w:p>",
+        color = rule.color
+    )
 }
 
 /// Render a header/footer line whose runs sit apart as a borderless table — a

@@ -102,5 +102,13 @@ measured header/footer position rather than hardcoded. A line whose runs sit apa
 (a left/right `grid`) becomes a **borderless table** with the measured column
 widths and cell margins zeroed to match the grid's inset.
 
-Not yet emitted from a header: the `#line` divider (a shape) and images.
+Not yet emitted from a header: images.
+
+### Horizontal rules
+
+`#line(length: 100%)` is a stroked shape (not text), so it's recovered from the
+layout (`Geometry::Line` with a horizontal direction) and emitted as an empty
+paragraph with a bottom border (`w:pBdr`), sized from the stroke thickness and
+color. In the body, rules are interleaved with the HTML-driven content by their
+vertical position.
 

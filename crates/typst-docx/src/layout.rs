@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use typst_library::layout::{Frame, FrameItem, Point};
 use typst_library::text::{FontStyle, TextItem};
-use typst_library::visualize::Paint;
+use typst_library::visualize::{Geometry, Paint};
 use typst_library::{World, WorldExt};
 use typst_layout::{Page, PagedDocument};
 
@@ -96,6 +96,80 @@ pub fn collect_runs(document: &PagedDocument) -> Vec<Run> {
         });
     }
     runs
+}
+
+/// A horizontal rule (a stroked line) measured from the layout.
+#[derive(Clone, Debug)]
+pub struct Rule {
+    /// The rule's left end, in points.
+    pub x_pt: f64,
+    /// The rule's y position, in points.
+    pub y_pt: f64,
+    /// The rule's length, in points.
+    pub width_pt: f64,
+    /// The rule's thickness, in points.
+    pub thickness_pt: f64,
+    /// The rule's color as `RRGGBB`.
+    pub color: String,
+    /// The 1-based page number.
+    pub page: u64,
+    /// Which page region the rule belongs to.
+    pub region: PageRegion,
+}
+
+/// Collect every horizontal rule in the document.
+pub fn collect_rules(document: &PagedDocument) -> Vec<Rule> {
+    let mut rules = Vec::new();
+    for (index, page) in document.pages().iter().enumerate() {
+        let height = page.frame.size().y.to_pt();
+        let top = page.margin.top.to_pt();
+        let bottom = page.margin.bottom.to_pt();
+
+        walk_items(&page.frame, Point::zero(), &mut |item, at| {
+            let FrameItem::Shape(shape, _) = item else { return };
+            let Geometry::Line(end) = &shape.geometry else { return };
+            if end.y.to_pt().abs() > 0.5 || end.x.to_pt() <= 0.5 {
+                return;
+            }
+            let stroke = shape.stroke.as_ref();
+            let thickness_pt = stroke.map(|s| s.thickness.to_pt()).unwrap_or(1.0);
+            let color = match stroke.map(|s| &s.paint) {
+                Some(Paint::Solid(color)) => {
+                    color.to_hex().trim_start_matches('#').to_ascii_uppercase()
+                }
+                _ => "000000".to_string(),
+            };
+            let y_pt = at.y.to_pt();
+            rules.push(Rule {
+                x_pt: at.x.to_pt(),
+                y_pt,
+                width_pt: end.x.to_pt(),
+                thickness_pt,
+                color,
+                page: index as u64 + 1,
+                region: if y_pt < top {
+                    PageRegion::Header
+                } else if y_pt > height - bottom {
+                    PageRegion::Footer
+                } else {
+                    PageRegion::Body
+                },
+            });
+        });
+    }
+    rules
+}
+
+/// Recursively visit all frame items, accumulating placement offsets.
+fn walk_items(frame: &Frame, origin: Point, f: &mut dyn FnMut(&FrameItem, Point)) {
+    for (pos, item) in frame.items() {
+        let at = Point::new(origin.x + pos.x, origin.y + pos.y);
+        f(item, at);
+        if let FrameItem::Group(group) = item {
+            let inner = Point::new(at.x + group.transform.tx, at.y + group.transform.ty);
+            walk_items(&group.frame, inner, f);
+        }
+    }
 }
 
 /// Write a single page and its text runs.
