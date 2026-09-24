@@ -55,6 +55,13 @@ pub fn docx(
         body_rules,
         rule_cursor: 0,
         last_y: 0.0,
+        content_width_pt: layout
+            .and_then(|doc| doc.pages().first())
+            .map(|page| {
+                let size = page.frame.size();
+                (size.x - page.margin.left - page.margin.right).to_pt()
+            })
+            .unwrap_or(450.0),
     };
 
     if let Some(body) = find_body(document.root()) {
@@ -211,6 +218,8 @@ struct Emitter<'a> {
     rule_cursor: usize,
     /// The y of the most recently matched block, for interleaving rules.
     last_y: f64,
+    /// The available content width in points, for resolving grid tracks.
+    content_width_pt: f64,
 }
 
 impl Emitter<'_> {
@@ -557,12 +566,38 @@ impl Emitter<'_> {
             return;
         }
 
-        self.out.push_str(
+        let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
+        let mut col_chars = vec![0usize; cols];
+        for row in &rows {
+            let mut index = 0;
+            for cell in &row.children {
+                let HtmlNode::Element(c) = cell else { continue };
+                if c.tag != tag::td && c.tag != tag::th {
+                    continue;
+                }
+                if index < cols {
+                    col_chars[index] = col_chars[index].max(text_len(c));
+                }
+                index += 1;
+            }
+        }
+        let (mut widths, gap) = resolve_tracks(style, self.content_width_pt, &col_chars);
+        if widths.len() != cols {
+            widths = vec![3000; cols];
+        }
+        let gap_half = gap / 2;
+        let total: i64 = widths.iter().sum();
+
+        self.out.push_str(&format!(
             "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/>\
-             <w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblLook w:val=\"04A0\"/></w:tblPr><w:tblGrid>",
-        );
-        for _ in 0..cols {
-            self.out.push_str("<w:gridCol w:w=\"3000\"/>");
+             <w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
+             <w:tblLayout w:type=\"fixed\"/><w:tblCellMar>\
+             <w:left w:w=\"{gap_half}\" w:type=\"dxa\"/>\
+             <w:right w:w=\"{gap_half}\" w:type=\"dxa\"/></w:tblCellMar>\
+             <w:tblLook w:val=\"04A0\"/></w:tblPr><w:tblGrid>"
+        ));
+        for width in &widths {
+            self.out.push_str(&format!("<w:gridCol w:w=\"{width}\"/>"));
         }
         self.out.push_str("</w:tblGrid>");
 
@@ -574,13 +609,15 @@ impl Emitter<'_> {
                 if c.tag != tag::td && c.tag != tag::th {
                     continue;
                 }
+                let width = widths.get(cells).copied().unwrap_or(3000);
                 cells += 1;
                 self.out.push_str("<w:tc><w:tcPr>");
                 if c.tag == tag::th {
                     self.out
                         .push_str("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"0B3C5D\"/>");
                 }
-                self.out.push_str("<w:tcW w:w=\"3000\" w:type=\"dxa\"/></w:tcPr>");
+                self.out
+                    .push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/></w:tcPr>"));
                 let runs = inline(&c.children, c.tag == tag::th, false, false);
                 // Cells always contain at least one paragraph.
                 if runs.is_empty() {
@@ -590,10 +627,11 @@ impl Emitter<'_> {
                 }
                 self.out.push_str("</w:tc>");
             }
-            for _ in cells..cols {
-                self.out.push_str(
-                    "<w:tc><w:tcPr><w:tcW w:w=\"3000\" w:type=\"dxa\"/></w:tcPr><w:p/></w:tc>",
-                );
+            for index in cells..cols {
+                let width = widths.get(index).copied().unwrap_or(3000);
+                self.out.push_str(&format!(
+                    "<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/></w:tcPr><w:p/></w:tc>"
+                ));
             }
             self.out.push_str("</w:tr>");
         }
@@ -680,6 +718,80 @@ fn list_style_none(el: &HtmlElement) -> bool {
                 .any(|d| d.replace(' ', "").starts_with("list-style-type:none"))
         })
         .unwrap_or(false)
+}
+
+/// Resolve a `grid-template-columns` / `column-gap` style into Word column
+/// widths (twips) and a gutter (twips), against the available content width.
+fn resolve_tracks(style: &str, available_pt: f64, col_chars: &[usize]) -> (Vec<i64>, i64) {
+    let mut fixed: Vec<Option<f64>> = Vec::new();
+    let mut flex: Vec<f64> = Vec::new();
+    let mut gap = 0.0;
+
+    for declaration in style.split(';') {
+        let declaration = declaration.trim();
+        if let Some(value) = declaration.strip_prefix("grid-template-columns:") {
+            let mut index = 0;
+            for track in value.split_whitespace() {
+                if let Some(number) = track.strip_suffix("fr") {
+                    fixed.push(None);
+                    flex.push(number.trim().parse().unwrap_or(1.0));
+                } else if let Some(number) = track.strip_suffix("pt") {
+                    fixed.push(Some(number.trim().parse().unwrap_or(0.0)));
+                    flex.push(0.0);
+                } else if let Some(number) = track.strip_suffix("em") {
+                    fixed.push(Some(number.trim().parse::<f64>().unwrap_or(0.0) * 10.5));
+                    flex.push(0.0);
+                } else {
+                    // `auto`: estimate from the column's widest cell content.
+                    let chars = col_chars.get(index).copied().unwrap_or(0);
+                    fixed.push(Some(chars as f64 * 5.25));
+                    flex.push(0.0);
+                }
+                index += 1;
+            }
+        } else if let Some(value) = declaration.strip_prefix("column-gap:") {
+            gap = value
+                .trim()
+                .strip_suffix("pt")
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0.0);
+        }
+    }
+
+    if fixed.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let total_gap = gap * (fixed.len() as f64 - 1.0).max(0.0);
+    let free = (available_pt - total_gap).max(0.0);
+    let fixed_sum: f64 = fixed.iter().flatten().sum();
+    let flex_sum: f64 = flex.iter().sum();
+    let unit = if flex_sum > 0.0 {
+        (free - fixed_sum).max(0.0) / flex_sum
+    } else {
+        0.0
+    };
+
+    let widths = fixed
+        .iter()
+        .zip(flex.iter())
+        .map(|(fixed, flex)| ((fixed.unwrap_or(0.0) + flex * unit) * 20.0).round() as i64)
+        .collect();
+
+    (widths, (gap * 20.0).round() as i64)
+}
+
+/// The number of characters in an element's text (for `auto` track sizing).
+fn text_len(el: &HtmlElement) -> usize {
+    let mut count = 0;
+    for child in &el.children {
+        match child {
+            HtmlNode::Text(text, _) => count += text.chars().count(),
+            HtmlNode::Element(element) => count += text_len(element),
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Map a CSS `text-align` declaration to a Word `w:jc` value.

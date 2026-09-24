@@ -14,7 +14,8 @@ use typst_library::introspection::{
 };
 use typst_library::layout::resolve::{Cell, CellGrid, Entry, Header};
 use typst_library::layout::{
-    AlignElem, BlockElem, HAlignment, HElem, OuterVAlignment, Sizing,
+    AlignElem, BlockElem, GridCell, GridElem, HAlignment, HElem, Length, OuterVAlignment,
+    Sizing,
 };
 use typst_library::math::EquationElem;
 use typst_library::math::ir::resolve_equation;
@@ -69,6 +70,7 @@ pub fn register(rules: &mut NativeRuleMap) {
     rules.register(Html, CSL_INDENT_RULE);
     rules.register(Html, TABLE_RULE);
     rules.register(Html, TABLE_CELL_RULE);
+    rules.register(Html, GRID_RULE);
     rules.register(Html, ALIGN_RULE);
 
     // Text.
@@ -594,6 +596,13 @@ const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
     Ok(show_cellgrid(grid, styles, elem.span()))
 };
 
+/// A `grid` has the same resolved cell structure as a `table`, so it exports as
+/// a `<table>` too (previously it was dropped entirely).
+const GRID_RULE: ShowFn<GridElem> = |elem, _, styles| {
+    let grid = elem.grid.as_ref().unwrap();
+    Ok(show_cellgrid(grid, styles, elem.span()))
+};
+
 fn show_cellgrid(grid: &CellGrid, styles: StyleChain, span: Span) -> Content {
     let elem = |tag, body| HtmlElem::new(tag).with_body(Some(body)).pack().spanned(span);
     let mut rows: Vec<_> = grid.entries.chunks(grid.non_gutter_column_count()).collect();
@@ -682,25 +691,82 @@ fn show_cellgrid(grid: &CellGrid, styles: StyleChain, span: Span) -> Content {
     }
 
     let content = header.into_iter().chain(core::iter::once(body)).chain(footer);
-    BlockElem::packed(elem(tag::table, Content::sequence(content)))
+
+    // Carry the column tracks (and gutter) so a downstream consumer can
+    // reproduce the grid's columns exactly instead of guessing equal widths.
+    let tracks: Vec<String> = if grid.has_gutter {
+        grid.cols.iter().step_by(2).copied().map(sizing_css).collect()
+    } else {
+        grid.cols.iter().copied().map(sizing_css).collect()
+    };
+    let gutter = if grid.has_gutter {
+        grid.cols.get(1).copied().map(sizing_css)
+    } else {
+        None
+    };
+
+    let mut attrs = HtmlAttrs::new();
+    let mut style = eco_format!("grid-template-columns: {}", tracks.join(" "));
+    if let Some(gutter) = gutter {
+        style.push_str(&eco_format!("; column-gap: {gutter}"));
+    }
+    attrs.push(attr::style, style);
+
+    BlockElem::packed(
+        HtmlElem::new(tag::table)
+            .with_body(Some(Content::sequence(content)))
+            .with_attrs(attrs)
+            .pack()
+            .spanned(span),
+    )
+}
+
+/// Serialize a track sizing to a CSS value.
+fn sizing_css(sizing: Sizing) -> String {
+    match sizing {
+        Sizing::Auto => "auto".to_string(),
+        Sizing::Fr(fr) => format!("{}fr", fr.get()),
+        Sizing::Rel(rel) => {
+            let length = rel.relative_to(Length::zero());
+            if length.em.get() != 0.0 {
+                format!("{}em", length.em.get())
+            } else {
+                format!("{}pt", length.abs.to_pt())
+            }
+        }
+    }
 }
 
 fn show_cell(tag: HtmlTag, cell: &Cell, styles: StyleChain) -> Content {
-    let cell = cell.body.clone();
-    let Some(cell) = cell.to_packed::<TableCell>() else { return cell };
-    let mut attrs = HtmlAttrs::new();
+    let body = cell.body.clone();
     let span = |n: NonZeroUsize| (n != NonZeroUsize::MIN).then(|| n.to_string());
-    if let Some(colspan) = span(cell.colspan.get(styles)) {
-        attrs.push(attr::colspan, colspan);
-    }
-    if let Some(rowspan) = span(cell.rowspan.get(styles)) {
-        attrs.push(attr::rowspan, rowspan);
-    }
+    let mut attrs = HtmlAttrs::new();
+
+    let (content, source) = if let Some(table) = body.to_packed::<TableCell>() {
+        if let Some(colspan) = span(table.colspan.get(styles)) {
+            attrs.push(attr::colspan, colspan);
+        }
+        if let Some(rowspan) = span(table.rowspan.get(styles)) {
+            attrs.push(attr::rowspan, rowspan);
+        }
+        (table.body.clone(), table.span())
+    } else if let Some(grid) = body.to_packed::<GridCell>() {
+        if let Some(colspan) = span(grid.colspan.get(styles)) {
+            attrs.push(attr::colspan, colspan);
+        }
+        if let Some(rowspan) = span(grid.rowspan.get(styles)) {
+            attrs.push(attr::rowspan, rowspan);
+        }
+        (grid.body.clone(), grid.span())
+    } else {
+        (body, Span::detached())
+    };
+
     HtmlElem::new(tag)
-        .with_body(Some(cell.clone().pack()))
+        .with_body(Some(content))
         .with_attrs(attrs)
         .pack()
-        .spanned(cell.span())
+        .spanned(source)
 }
 
 const TABLE_CELL_RULE: ShowFn<TableCell> = |elem, _, _| Ok(elem.body.clone());
