@@ -81,6 +81,7 @@ pub fn docx(
         body_images,
         collect_footnotes(document.root()),
         0,
+        0,
     );
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
@@ -95,13 +96,18 @@ pub fn docx(
     // The page header/footer are emitted structurally by the HTML export (grids,
     // rules, alignment); their typography is recovered from the layout runs in
     // that region.
+    let (header_rule_before, _) =
+        region_rule_gaps(&header_runs, &rules, layout::PageRegion::Header);
+    let (_, footer_rule_after) =
+        region_rule_gaps(&footer_runs, &rules, layout::PageRegion::Footer);
     let header = region_from_html(
         document.root(),
         tag::header,
         &header_runs,
         content_width_pt,
         header_images,
-        region_rule_before(&header_runs, &rules, layout::PageRegion::Header),
+        header_rule_before,
+        0,
     );
     let footer = region_from_html(
         document.root(),
@@ -109,7 +115,8 @@ pub fn docx(
         &footer_runs,
         content_width_pt,
         footer_images,
-        region_rule_before(&footer_runs, &rules, layout::PageRegion::Footer),
+        0,
+        footer_rule_after,
     );
     let (header_dist, footer_dist) = header_footer_distances(&all, layout);
 
@@ -150,10 +157,20 @@ fn region_from_html(
     content_width_pt: f64,
     images: Vec<layout::ImageInfo>,
     rule_before: i64,
+    rule_after: i64,
 ) -> Option<String> {
     let el = find_element(root, tag_name)?;
     let is_footer = tag_name == tag::footer;
-    let mut em = Emitter::new(runs, content_width_pt, true, is_footer, images, Vec::new(), rule_before);
+    let mut em = Emitter::new(
+        runs,
+        content_width_pt,
+        true,
+        is_footer,
+        images,
+        Vec::new(),
+        rule_before,
+        rule_after,
+    );
     for child in &el.children {
         em.block(child);
     }
@@ -255,29 +272,41 @@ fn footnote_run(run: &Run) -> String {
     out
 }
 
-/// The measured gap before a region's first rule, in twips.
-fn region_rule_before(
+/// The measured gaps around a region's first rule, in twips.
+fn region_rule_gaps(
     runs: &[layout::Run],
     rules: &[layout::Rule],
     region: layout::PageRegion,
-) -> i64 {
+) -> (i64, i64) {
     let Some(rule) = rules
         .iter()
         .find(|rule| rule.region == region && rule.page == 1)
     else {
-        return 0;
+        return (0, 0);
     };
     let top = rule.y_pt - rule.thickness_pt / 2.0;
-    let bottom = runs
+    let bottom = rule.y_pt + rule.thickness_pt / 2.0;
+    let text_top = runs
+        .iter()
+        .filter(|run| run.region == region)
+        .map(|run| run.y_pt - run.ascent_pt)
+        .fold(f64::INFINITY, f64::min);
+    let text_bottom = runs
         .iter()
         .filter(|run| run.region == region)
         .map(|run| run.y_pt + run.descent_pt)
-        .fold(f64::MIN, f64::max);
-    if bottom.is_finite() {
-        ((top - bottom).max(0.0) * 20.0).round() as i64
+        .fold(f64::NEG_INFINITY, f64::max);
+    let before = if text_bottom.is_finite() {
+        ((top - text_bottom).max(0.0) * 20.0).round() as i64
     } else {
         0
-    }
+    };
+    let after = if text_top.is_finite() {
+        ((text_top - bottom).max(0.0) * 20.0).round() as i64
+    } else {
+        0
+    };
+    (before, after)
 }
 
 /// Find the first descendant element with the given tag.
@@ -416,6 +445,7 @@ struct Emitter<'a> {
     is_region: bool,
     /// The measured gap before the region's first rule, in twips.
     rule_before: i64,
+    rule_after: i64,
     /// The representative typography of the paragraph being emitted, used as a
     /// fallback for runs that don't match a layout run (e.g. a footer page
     /// number).
@@ -446,6 +476,7 @@ impl Emitter<'_> {
         layout_images: Vec<layout::ImageInfo>,
         footnotes: Vec<Footnote>,
         rule_before: i64,
+        rule_after: i64,
     ) -> Emitter<'_> {
         Emitter {
             out: String::new(),
@@ -468,6 +499,7 @@ impl Emitter<'_> {
             is_footer,
             is_region,
             rule_before,
+            rule_after,
             current_typo: None,
             layout_images,
             image_cursor: 0,
@@ -611,8 +643,12 @@ impl Emitter<'_> {
         } else if t == tag::hr {
             let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
             let (thickness, color) = parse_hr_style(style);
-            self.out
-                .push_str(&rule_paragraph(thickness, &color, self.rule_before));
+            self.out.push_str(&rule_paragraph(
+                thickness,
+                &color,
+                self.rule_before,
+                self.rule_after,
+            ));
         } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("pagebreak") {
             self.out
                 .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
@@ -659,6 +695,14 @@ impl Emitter<'_> {
         self.out.push_str("<w:p><w:pPr>");
         self.out
             .push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
+        if style == "Heading2"
+            && self.blocks.get(self.blocks.len().saturating_sub(2))
+                .is_some_and(|previous| previous.style == "Heading1")
+        {
+            // Consecutive levels keep the larger Typst block gap; a heading
+            // followed by body text has only its own compact after-gap.
+            self.out.push_str("<w:spacing w:before=\"300\"/>");
+        }
         if self.in_cell {
             let line = (typos.iter().flatten().map(|t| t.size_pt).fold(10.5_f64, f64::max)
                 * 20.0).round() as i64;
@@ -698,16 +742,17 @@ impl Emitter<'_> {
             ));
         }
         self.out.push_str("</w:pPr>");
+        let compensate_width = style == "Normal" && runs.iter().any(|run| run.math_xml.is_some());
         for (index, (run, typo)) in runs.iter().zip(typos.iter()).enumerate() {
             if let Some((number_index, instruction)) = &self.caption_seq
                 && index == *number_index
             {
                 self.out.push_str(&format!("<w:fldSimple w:instr=\"{}\">", escape_xml(instruction)));
-                self.run(run, typo.as_ref());
+                self.run(run, typo.as_ref(), compensate_width);
                 self.out.push_str("</w:fldSimple>");
                 continue;
             }
-            self.run(run, typo.as_ref());
+            self.run(run, typo.as_ref(), compensate_width);
         }
         if let Some(page) = self.toc_page {
             self.out.push_str(&format!(
@@ -826,7 +871,8 @@ impl Emitter<'_> {
             && self.body_rules[self.rule_cursor].y_pt < self.last_y
         {
             let rule = self.body_rules[self.rule_cursor].clone();
-            self.out.push_str(&rule_paragraph(rule.thickness_pt, &rule.color, 0));
+            self.out
+                .push_str(&rule_paragraph(rule.thickness_pt, &rule.color, 0, 0));
             self.rule_cursor += 1;
         }
     }
@@ -835,12 +881,13 @@ impl Emitter<'_> {
     fn flush_all_rules(&mut self) {
         while self.rule_cursor < self.body_rules.len() {
             let rule = self.body_rules[self.rule_cursor].clone();
-            self.out.push_str(&rule_paragraph(rule.thickness_pt, &rule.color, 0));
+            self.out
+                .push_str(&rule_paragraph(rule.thickness_pt, &rule.color, 0, 0));
             self.rule_cursor += 1;
         }
     }
 
-    fn run(&mut self, run: &Run, typo: Option<&Typography>) {
+    fn run(&mut self, run: &Run, typo: Option<&Typography>, compensate_width: bool) {
         if let Some(math) = &run.math_xml {
             self.out.push_str(math);
             return;
@@ -896,6 +943,11 @@ impl Emitter<'_> {
             None => None,
         };
         self.out.push_str("<w:r>");
+        let spacing = if compensate_width {
+            "<w:spacing w:val=\"-3\"/>"
+        } else {
+            ""
+        };
         if let Some(typo) = typo {
             let size = (typo.size_pt * 2.0).round().max(2.0) as i64;
             self.out.push_str("<w:rPr>");
@@ -910,8 +962,8 @@ impl Emitter<'_> {
                 self.out.push_str("<w:i/>");
             }
             self.out.push_str(&format!(
-                "<w:color w:val=\"{}\"/><w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/>",
-                typo.color
+                "<w:color w:val=\"{}\"/>{}<w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/>",
+                typo.color, spacing
             ));
             if run.strike {
                 self.out.push_str("<w:strike/>");
@@ -920,7 +972,7 @@ impl Emitter<'_> {
                 self.out.push_str("<w:highlight w:val=\"yellow\"/>");
             }
             self.out.push_str("</w:rPr>");
-        } else if run.bold || run.italic || run.mono || run.strike || run.highlight {
+        } else if run.bold || run.italic || run.mono || run.strike || run.highlight || compensate_width {
             self.out.push_str("<w:rPr>");
             if run.mono {
                 self.out.push_str(
@@ -933,6 +985,7 @@ impl Emitter<'_> {
             if run.italic {
                 self.out.push_str("<w:i/>");
             }
+            self.out.push_str(spacing);
             if run.strike {
                 self.out.push_str("<w:strike/>");
             }
@@ -1134,7 +1187,7 @@ impl Emitter<'_> {
         let align = self.align.as_deref().unwrap_or("left");
 
         self.out.push_str(&format!(
-            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"20\" \
+            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" \
              w:lineRule=\"auto\"/><w:jc w:val=\"{align}\"/></w:pPr>\
              <w:r><w:drawing><wp:inline \
              xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
@@ -1191,6 +1244,12 @@ impl Emitter<'_> {
         collect_rows(el, &mut rows);
         if rows.is_empty() {
             return;
+        }
+        if self.blocks.last().is_some_and(|previous| previous.style == "Heading1") {
+            // A table has no paragraph spacing of its own in Word. Typst
+            // leaves a little more space after a section title than Word's
+            // heading line box supplies before the table border.
+            self.out.push_str("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"100\" w:lineRule=\"exact\"/></w:pPr></w:p>");
         }
         let cols = rows
             .iter()
@@ -1784,9 +1843,9 @@ fn collapse(text: &str) -> String {
 
 /// Derive per-style block spacing and indentation from the layout.
 ///
-/// Only the space *below* each block is recorded; `space_before` is left at
-/// zero so consecutive blocks don't double up their spacing. Word reflows text,
-/// so intra-paragraph line spacing is deliberately not measured.
+/// The space below each block is recorded. Heading space before is handled
+/// separately so headings following tables/figures retain Typst's block gap.
+/// Word reflows text, so intra-paragraph line spacing is deliberately not measured.
 fn compute_spacing(
     runs: &[layout::Run],
     measured: &mut HashMap<&'static str, Measured>,
@@ -2046,12 +2105,12 @@ fn header_footer_distances(
 }
 
 /// Render a horizontal rule as an empty paragraph with a bottom border.
-fn rule_paragraph(thickness_pt: f64, color: &str, before: i64) -> String {
+fn rule_paragraph(thickness_pt: f64, color: &str, before: i64, after: i64) -> String {
     let sz = (thickness_pt * 8.0).round().clamp(2.0, 96.0) as i64;
     format!(
         "<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"{sz}\" w:space=\"0\" \
          w:color=\"{color}\"/></w:pBdr>\
-         <w:spacing w:before=\"{before}\" w:after=\"0\" w:line=\"20\" w:lineRule=\"exact\"/>\
+         <w:spacing w:before=\"{before}\" w:after=\"{after}\" w:line=\"20\" w:lineRule=\"exact\"/>\
          </w:pPr></w:p>"
     )
 }
@@ -2251,16 +2310,15 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
     // Patch measured block spacing (space below each block) and line pitch.
     // `atLeast` enforces Typst's baseline pitch (which includes leading, so it
     // is larger than the font's natural line height) without clipping.
-    let spacing = |m: &Measured| -> String {
-        let after = (m.after_pt * 20.0).round() as i64;
+    let spacing = |m: &Measured, before: i64, after: i64| -> String {
         if m.line_pt > 0.0 {
             let line = (m.line_pt * 20.0).round() as i64;
             format!(
-                "<w:spacing w:before=\"0\" w:after=\"{after}\" w:line=\"{line}\" \
-                 w:lineRule=\"atLeast\"/>"
+                "<w:spacing w:before=\"{before}\" w:after=\"{after}\" w:line=\"{line}\" \
+                  w:lineRule=\"atLeast\"/>"
             )
         } else {
-            format!("<w:spacing w:before=\"0\" w:after=\"{after}\"/>")
+            format!("<w:spacing w:before=\"{before}\" w:after=\"{after}\"/>")
         }
     };
 
@@ -2291,7 +2349,14 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
     for (style, anchor, keep_next) in spacing_patches {
         if let Some(m) = measured.get(style) {
             let keep = if keep_next { "<w:keepNext/>" } else { "" };
-            s = s.replace(anchor, &format!("{keep}{}", spacing(m)));
+            // Typst places a roughly 10pt block gap before first-level
+            // headings. Word's measured `after` alone disappears when the
+            // preceding block is a table or a figure caption.
+            let before = if style == "Heading1" { 200 } else { 0 };
+            // A heading-to-paragraph gap is small in Typst. The measured
+            // Heading1 median included larger gaps to other headings/blocks.
+            let after = if style == "Heading1" { 0 } else { (m.after_pt * 20.0).round() as i64 };
+            s = s.replace(anchor, &format!("{keep}{}", spacing(m, before, after)));
         }
     }
 
@@ -2301,7 +2366,7 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
             "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:uiPriority w:val=\"0\"/><w:qFormat/></w:style>",
             &format!(
                 "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:uiPriority w:val=\"0\"/><w:qFormat/><w:pPr>{}</w:pPr></w:style>",
-                spacing(m)
+                spacing(m, 0, (m.after_pt * 20.0).round() as i64)
             ),
         );
     }
@@ -2320,7 +2385,7 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
         let left = (m.indent_pt * 20.0).round().max(0.0) as i64;
         s = s.replace(
             "<w:pPr><w:ind w:left=\"720\"/></w:pPr>",
-            &format!("<w:pPr>{}<w:ind w:left=\"{left}\"/></w:pPr>", spacing(m)),
+            &format!("<w:pPr>{}<w:ind w:left=\"{left}\"/></w:pPr>", spacing(m, 0, (m.after_pt * 20.0).round() as i64)),
         );
     }
 
