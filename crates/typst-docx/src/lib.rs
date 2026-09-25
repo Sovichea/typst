@@ -116,6 +116,7 @@ pub fn docx(
     let document_xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+         xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\" \
          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
          <w:body>{}{}</w:body></w:document>",
         em.out,
@@ -312,6 +313,7 @@ fn find_body(el: &HtmlElement) -> Option<&HtmlElement> {
 #[derive(Clone)]
 struct Run {
     text: String,
+    math_xml: Option<String>,
     bold: bool,
     italic: bool,
     mono: bool,
@@ -387,6 +389,11 @@ struct Emitter<'a> {
     /// The current paragraph alignment (`w:jc` value), set while recursing into
     /// an aligned container.
     align: Option<String>,
+    figure_gap: Option<i64>,
+    in_cell: bool,
+    /// The numbered run in the caption currently being emitted, if any.
+    caption_seq: Option<(usize, String)>,
+    caption_counters: HashMap<String, u64>,
     /// Next numbering id handed out to a new ordered list.
     next_num_id: u32,
     /// Ordered-list numbering ids that were handed out.
@@ -447,6 +454,10 @@ impl Emitter<'_> {
             blocks: Vec::new(),
             cursor: 0,
             align: None,
+            figure_gap: None,
+            in_cell: false,
+            caption_seq: None,
+            caption_counters: HashMap::new(),
             next_num_id: 100,
             ordered_num_ids: Vec::new(),
             indent: None,
@@ -485,6 +496,7 @@ impl Emitter<'_> {
                 if !trimmed.is_empty() {
                     let runs = vec![Run {
                         text: trimmed.to_string(),
+                        math_xml: None,
                         bold: false,
                         italic: false,
                         mono: false,
@@ -527,17 +539,50 @@ impl Emitter<'_> {
             let runs = inline(&el.children, false, false, false, None);
             self.paragraph("Heading4", &runs, None);
         } else if t == tag::p {
-            let runs = inline(&el.children, false, false, false, None);
-            self.paragraph("Normal", &runs, None);
+            let previous = self.align.clone();
+            if let Some(align) = el.attrs.get(attr::style).and_then(|s| parse_text_align(s)) {
+                self.align = Some(align);
+            }
+            if let [HtmlNode::Element(box_el)] = el.children.as_slice()
+                && box_el.tag == tag::span
+                && box_el.attrs.get(attr::style).is_some_and(|style| style.contains("background-color:"))
+            {
+                self.filled_box(box_el);
+            } else {
+                let runs = inline(&el.children, false, false, false, None);
+                self.paragraph("Normal", &runs, None);
+            }
+            self.align = previous;
         } else if t == tag::blockquote {
-            let runs = inline(&el.children, false, true, false, None);
+            let mut runs = inline(&el.children, false, true, false, None);
+            for index in (1..runs.len().saturating_sub(1)).rev() {
+                if runs[index].text == " "
+                    && (runs[index - 1].text == "“" || runs[index + 1].text == "”")
+                {
+                    runs.remove(index);
+                }
+            }
             self.paragraph("Quote", &runs, None);
         } else if t == tag::pre {
             let runs = inline(&el.children, false, false, true, None);
             self.paragraph("Code", &runs, None);
+        } else if t == tag::mathml::math {
+            self.out.push_str("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/><w:jc w:val=\"center\"/></w:pPr><m:oMathPara><m:oMath>");
+            for child in &el.children {
+                self.out.push_str(&omml_node(child));
+            }
+            self.out.push_str("</m:oMath></m:oMathPara></w:p>");
         } else if t == tag::figcaption || t == tag::caption {
-            let runs = inline(&el.children, false, true, false, None);
+            let runs = inline(&el.children, false, false, false, None);
+            if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-numbered-caption") {
+                if let Some((index, label, number)) = caption_number(&runs) {
+                    let previous = self.caption_counters.insert(label.clone(), number).unwrap_or(0);
+                    let reset = if number != previous + 1 { format!(" \\r {number}") } else { String::new() };
+                    self.caption_seq = Some((index, format!(" SEQ {label}{reset} \\* ARABIC ")));
+                }
+            }
             self.paragraph("Caption", &runs, None);
+            self.caption_seq = None;
         } else if t == tag::ul {
             if list_style_none(el) {
                 self.plain_list(el, 0);
@@ -553,6 +598,10 @@ impl Emitter<'_> {
             }
         } else if t == tag::table {
             self.table(el);
+        } else if t == tag::span
+            && el.attrs.get(attr::style).is_some_and(|style| style.contains("background-color:"))
+        {
+            self.filled_box(el);
         } else if t == tag::dl {
             self.definition_list(el);
         } else if t == tag::img {
@@ -571,6 +620,15 @@ impl Emitter<'_> {
             // div/section/figure/body/... : honor a `text-align`, then either
             // recurse (block children) or emit inline content as one paragraph.
             let previous = self.align.clone();
+            let previous_gap = self.figure_gap;
+            if t == tag::figure {
+                self.figure_gap = el.attrs.get(attr::style).and_then(|s| parse_pt_property(s, "figure-gap:"));
+                if find_element(el, tag::img).is_some() {
+                    // Word's inline drawing line box adds ~5pt below the
+                    // image. Avoid counting it again as caption spacing.
+                    self.figure_gap = self.figure_gap.map(|gap| (gap - 100).max(0));
+                }
+            }
             if let Some(align) = el.attrs.get(attr::style).and_then(|s| parse_text_align(s)) {
                 self.align = Some(align);
             }
@@ -585,6 +643,7 @@ impl Emitter<'_> {
                 }
             }
             self.align = previous;
+            self.figure_gap = previous_gap;
         }
     }
 
@@ -600,6 +659,14 @@ impl Emitter<'_> {
         self.out.push_str("<w:p><w:pPr>");
         self.out
             .push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
+        if self.in_cell {
+            let line = (typos.iter().flatten().map(|t| t.size_pt).fold(10.5_f64, f64::max)
+                * 20.0).round() as i64;
+            self.out.push_str(&format!("<w:spacing w:before=\"0\" w:after=\"0\" w:line=\"{line}\" w:lineRule=\"exact\"/>"));
+        } else if style == "Caption" {
+            let gap = self.figure_gap.unwrap_or(0);
+            self.out.push_str(&format!("<w:spacing w:before=\"{gap}\" w:after=\"0\"/>"));
+        }
         if self.is_region {
             // Header/footer paragraphs must not inherit the body's Normal
             // spacing; use the text's own line height.
@@ -631,7 +698,15 @@ impl Emitter<'_> {
             ));
         }
         self.out.push_str("</w:pPr>");
-        for (run, typo) in runs.iter().zip(typos.iter()) {
+        for (index, (run, typo)) in runs.iter().zip(typos.iter()).enumerate() {
+            if let Some((number_index, instruction)) = &self.caption_seq
+                && index == *number_index
+            {
+                self.out.push_str(&format!("<w:fldSimple w:instr=\"{}\">", escape_xml(instruction)));
+                self.run(run, typo.as_ref());
+                self.out.push_str("</w:fldSimple>");
+                continue;
+            }
             self.run(run, typo.as_ref());
         }
         if let Some(page) = self.toc_page {
@@ -678,6 +753,21 @@ impl Emitter<'_> {
             }
             let target = collapse(&run.text);
             if target.len() < 3 {
+                // Values such as `+9%` normalize to one character. Match the
+                // original text exactly when it occurs only once in the paged
+                // layout, so its explicit color is not lost.
+                let mut matches = self.runs.iter().filter(|candidate| candidate.text.trim() == run.text.trim());
+                if let Some(candidate) = matches.next()
+                    && matches.next().is_none()
+                {
+                    overrides[index] = Some(Typography {
+                        family: candidate.family.clone(),
+                        size_pt: candidate.size_pt,
+                        bold: candidate.bold,
+                        italic: candidate.italic,
+                        color: candidate.color.clone(),
+                    });
+                }
                 continue;
             }
 
@@ -703,6 +793,22 @@ impl Emitter<'_> {
                     italic: layout_run.italic,
                     color: layout_run.color.clone(),
                 });
+            } else {
+                // An HTML element (notably a figure/table) can advance the
+                // layout cursor past a cell run. Recover unique text from the
+                // paged layout so explicit colors still survive HTML export.
+                let mut matches = self.runs.iter().filter(|candidate| collapse(&candidate.text) == target);
+                if let Some(candidate) = matches.next()
+                    && matches.next().is_none()
+                {
+                    overrides[index] = Some(Typography {
+                        family: candidate.family.clone(),
+                        size_pt: candidate.size_pt,
+                        bold: candidate.bold,
+                        italic: candidate.italic,
+                        color: candidate.color.clone(),
+                    });
+                }
             }
         }
 
@@ -735,6 +841,10 @@ impl Emitter<'_> {
     }
 
     fn run(&mut self, run: &Run, typo: Option<&Typography>) {
+        if let Some(math) = &run.math_xml {
+            self.out.push_str(math);
+            return;
+        }
         if run.br {
             self.out.push_str("<w:r><w:br/></w:r>");
             return;
@@ -831,9 +941,15 @@ impl Emitter<'_> {
             }
             self.out.push_str("</w:rPr>");
         }
-        self.out.push_str("<w:t xml:space=\"preserve\">");
-        self.out.push_str(&escape_xml(&run.text));
-        self.out.push_str("</w:t></w:r>");
+        for (index, line) in run.text.split('\n').enumerate() {
+            if index > 0 {
+                self.out.push_str("<w:br/>");
+            }
+            self.out.push_str("<w:t xml:space=\"preserve\">");
+            self.out.push_str(&escape_xml(line));
+            self.out.push_str("</w:t>");
+        }
+        self.out.push_str("</w:r>");
         if hyperlink.is_some() {
             self.out.push_str("</w:hyperlink>");
         }
@@ -851,6 +967,7 @@ impl Emitter<'_> {
                 let mut runs = std::mem::take(&mut term);
                 runs.push(Run {
                     text: "  ".to_string(),
+                    math_xml: None,
                     bold: false,
                     italic: false,
                     mono: false,
@@ -889,6 +1006,7 @@ impl Emitter<'_> {
             if runs.iter().all(|r| r.text.trim().is_empty()) {
                 runs = vec![Run {
                     text: String::new(),
+                    math_xml: None,
                     bold: false,
                     italic: false,
                     mono: false,
@@ -1013,10 +1131,11 @@ impl Emitter<'_> {
         self.image_cursor += 1;
         let cx = (width * 12700.0).round() as i64;
         let cy = (height * 12700.0).round() as i64;
+        let align = self.align.as_deref().unwrap_or("left");
 
         self.out.push_str(&format!(
-            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" \
-             w:lineRule=\"auto\"/></w:pPr>\
+            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"20\" \
+             w:lineRule=\"auto\"/><w:jc w:val=\"{align}\"/></w:pPr>\
              <w:r><w:drawing><wp:inline \
              xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
              distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
@@ -1033,6 +1152,38 @@ impl Emitter<'_> {
              <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>\
              </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
         ));
+    }
+
+    /// A filled Typst box is a one-cell borderless table in Word. This keeps
+    /// its background and inset together when the text wraps across lines.
+    fn filled_box(&mut self, el: &HtmlElement) {
+        let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
+        let color = style.split(';').find_map(|part| part.trim().strip_prefix("background-color:"))
+            .map(|value| value.trim().trim_start_matches('#').to_ascii_uppercase())
+            .unwrap_or_else(|| "FFFFFF".into());
+        let (top, right, bottom, left) = parse_padding(style).unwrap_or((0, 0, 0, 0));
+        let width = (self.content_width_pt * 20.0).round() as i64;
+        self.out.push_str(&format!(
+            "<w:tbl><w:tblPr><w:tblW w:w=\"{width}\" w:type=\"dxa\"/>\
+             <w:jc w:val=\"left\"/><w:tblInd w:w=\"{left}\" w:type=\"dxa\"/>\
+             <w:tblLayout w:type=\"fixed\"/><w:tblBorders><w:top w:val=\"nil\"/>\
+             <w:bottom w:val=\"nil\"/><w:left w:val=\"nil\"/><w:right w:val=\"nil\"/>\
+             </w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w=\"{width}\"/></w:tblGrid>\
+             <w:tr><w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>\
+             <w:shd w:val=\"clear\" w:fill=\"{color}\"/>\
+             <w:tcMar><w:top w:w=\"{top}\" w:type=\"dxa\"/>\
+             <w:right w:w=\"{right}\" w:type=\"dxa\"/>\
+             <w:bottom w:w=\"{bottom}\" w:type=\"dxa\"/>\
+             <w:left w:w=\"{left}\" w:type=\"dxa\"/></w:tcMar></w:tcPr>"
+        ));
+        let runs = inline(&el.children, false, false, false, None);
+        self.in_cell = true;
+        self.paragraph("Normal", &runs, None);
+        self.in_cell = false;
+        self.out.push_str("</w:tc></w:tr></w:tbl>");
+        // Typst leaves block space after a filled box. The measured heading
+        // styles have no `before` spacing, so preserve that gap explicitly.
+        self.out.push_str("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"exact\"/></w:pPr></w:p>");
     }
 
     fn table(&mut self, el: &HtmlElement) {
@@ -1060,13 +1211,25 @@ impl Emitter<'_> {
                 if c.tag != tag::td && c.tag != tag::th {
                     continue;
                 }
-                if index < cols {
+                let colspan = c.attrs.get(attr::colspan)
+                    .and_then(|value| value.as_str().parse::<usize>().ok())
+                    .unwrap_or(1).max(1);
+                // A spanning cell's content belongs to the combined tracks;
+                // assigning its whole width to the first `auto` track makes
+                // narrow tables (e.g. Outlook) much too wide.
+                if colspan == 1 && index < cols {
                     col_chars[index] = col_chars[index].max(text_len(c));
                     if let Some(width) = self.measure_width(&text_of(c)) {
                         col_content[index] = Some(col_content[index].unwrap_or(0.0).max(width));
                     }
+                } else if colspan > 1 {
+                    let share = self.measure_width(&text_of(c))
+                        .unwrap_or(text_len(c) as f64 * 5.25) / colspan as f64;
+                    for track in index..index.saturating_add(colspan).min(cols) {
+                        col_content[track] = Some(col_content[track].unwrap_or(0.0).max(share));
+                    }
                 }
-                index += 1;
+                index += colspan;
             }
         }
         let (mut widths, gap) = resolve_tracks(style, self.content_width_pt, &col_content, &col_chars);
@@ -1083,9 +1246,24 @@ impl Emitter<'_> {
             "<w:tblStyle w:val=\"TableGrid\"/>"
         };
 
+        let table_align = self.align.as_deref().unwrap_or("left");
+        // Word places the left edge of a left-aligned table outside the text
+        // margin by its first cell's left margin. Typst aligns the table's
+        // border with the text margin instead, so offset the Word table by
+        // that same amount. Centered/right-aligned tables need no correction.
+        let first_cell_left = rows[0].children.iter().find_map(|node| {
+            let HtmlNode::Element(cell) = node else { return None };
+            if cell.tag != tag::td && cell.tag != tag::th { return None; }
+            cell.attrs.get(attr::style).and_then(|style| parse_padding(style).map(|(_, _, _, left)| left))
+        }).unwrap_or(gap_half);
+        let table_indent = if table_align == "left" {
+            format!("<w:tblInd w:w=\"{first_cell_left}\" w:type=\"dxa\"/>")
+        } else {
+            String::new()
+        };
         self.out.push_str(&format!(
-            "<w:tbl><w:tblPr>{tbl_style}\
-             <w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
+            "<w:tbl><w:tblPr>{tbl_style}<w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
+             <w:jc w:val=\"{table_align}\"/>{table_indent}\
              <w:tblLayout w:type=\"fixed\"/><w:tblCellMar>\
              <w:left w:w=\"{gap_half}\" w:type=\"dxa\"/>\
              <w:right w:w=\"{gap_half}\" w:type=\"dxa\"/></w:tblCellMar>\
@@ -1120,7 +1298,7 @@ impl Emitter<'_> {
                     self.out.push_str(&format!("<w:gridSpan w:val=\"{colspan}\"/>"));
                 }
                 self.out
-                    .push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/></w:tcPr>"));
+                    .push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/>"));
                 // `table.header` marks the header row for repetition, it does
                 // not style it, so header cells stay plain like Typst's.
                 let cell_style = c.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
@@ -1129,6 +1307,14 @@ impl Emitter<'_> {
                     self.align = Some(align);
                 }
                 if let Some((top, right, bottom, left)) = parse_padding(cell_style) {
+                    // Word lays out a taller text line inside a table cell than
+                    // Typst does. With 7pt on both sides, a 10.5pt benchmark
+                    // row renders ~25.4pt in Word versus 20.63pt in Typst.
+                    // Compensate only vertically: 4.55pt per side brings the
+                    // row pitch into line, while preserving horizontal inset.
+                    let word_vertical = |twips: i64| (twips as f64 * 0.65).round() as i64;
+                    let top = word_vertical(top);
+                    let bottom = word_vertical(bottom);
                     self.out.push_str(&format!(
                         "<w:tcMar><w:top w:w=\"{top}\" w:type=\"dxa\"/>\
                          <w:left w:w=\"{left}\" w:type=\"dxa\"/>\
@@ -1136,6 +1322,8 @@ impl Emitter<'_> {
                          <w:right w:w=\"{right}\" w:type=\"dxa\"/></w:tcMar>"
                     ));
                 }
+                self.out.push_str("</w:tcPr>");
+                self.in_cell = true;
                 let runs = inline(&c.children, false, false, false, None);
                 // Cells always contain at least one paragraph.
                 if runs.is_empty() {
@@ -1144,6 +1332,7 @@ impl Emitter<'_> {
                     self.paragraph("Normal", &runs, None);
                 }
                 self.align = previous;
+                self.in_cell = false;
                 self.out.push_str("</w:tc>");
             }
             for index in cells..cols {
@@ -1155,8 +1344,6 @@ impl Emitter<'_> {
             self.out.push_str("</w:tr>");
         }
         self.out.push_str("</w:tbl>");
-        // A table must be followed by a paragraph.
-        self.paragraph("Normal", &[], None);
     }
 }
 
@@ -1169,6 +1356,28 @@ fn collect_rows<'a>(el: &'a HtmlElement, rows: &mut Vec<&'a HtmlElement>) {
         if let HtmlNode::Element(child) = child {
             collect_rows(child, rows);
         }
+    }
+}
+
+/// Preserve the structure of MathML expressions as editable Office Math,
+/// rather than flattening fractions, radicals, and scripts into plain text.
+fn omml_node(node: &HtmlNode) -> String {
+    let HtmlNode::Element(el) = node else {
+        if let HtmlNode::Text(text, _) = node {
+            return format!("<m:r><m:t xml:space=\"preserve\">{}</m:t></m:r>", escape_xml(text));
+        }
+        return String::new();
+    };
+    let child = |index: usize| el.children.get(index).map(omml_node).unwrap_or_default();
+    let body = || el.children.iter().map(omml_node).collect::<String>();
+    match el.tag {
+        t if t == tag::mathml::mfrac => format!("<m:f><m:num>{}</m:num><m:den>{}</m:den></m:f>", child(0), child(1)),
+        t if t == tag::mathml::msup => format!("<m:sSup><m:e>{}</m:e><m:sup>{}</m:sup></m:sSup>", child(0), child(1)),
+        t if t == tag::mathml::msub => format!("<m:sSub><m:e>{}</m:e><m:sub>{}</m:sub></m:sSub>", child(0), child(1)),
+        t if t == tag::mathml::msubsup => format!("<m:sSubSup><m:e>{}</m:e><m:sub>{}</m:sub><m:sup>{}</m:sup></m:sSubSup>", child(0), child(1), child(2)),
+        t if t == tag::mathml::msqrt => format!("<m:rad><m:radPr><m:degHide m:val=\"1\"/></m:radPr><m:deg/><m:e>{}</m:e></m:rad>", body()),
+        t if t == tag::mathml::mspace => "<m:r><m:t xml:space=\"preserve\"> </m:t></m:r>".into(),
+        _ => body(),
     }
 }
 
@@ -1199,6 +1408,7 @@ fn collect_inline(
             if !text.is_empty() {
                 runs.push(Run {
                     text: text.to_string(),
+                    math_xml: None,
                     bold,
                     italic,
                     mono,
@@ -1212,6 +1422,18 @@ fn collect_inline(
         }
         HtmlNode::Element(el) => {
             let t = el.tag;
+            if t == tag::mathml::math {
+                let mut math = String::from("<m:oMath>");
+                for child in &el.children {
+                    math.push_str(&omml_node(child));
+                }
+                math.push_str("</m:oMath>");
+                runs.push(Run {
+                    text: text_of(el), math_xml: Some(math), bold, italic, mono,
+                    br: false, href: None, footnote_ref: None, strike: false, highlight: false,
+                });
+                return;
+            }
             // A footnote reference marker.
             if t == tag::sup
                 && el.attrs.get(attr::role).map(|r| r.as_str()) == Some("doc-noteref")
@@ -1219,6 +1441,7 @@ fn collect_inline(
                 if let Some(id) = element_number(el) {
                     runs.push(Run {
                         text: String::new(),
+                        math_xml: None,
                         bold: false,
                         italic: false,
                         mono: false,
@@ -1261,6 +1484,7 @@ fn collect_inline(
             } else if t == tag::br {
                 runs.push(Run {
                     text: " ".to_string(),
+                    math_xml: None,
                     bold,
                     italic,
                     mono,
@@ -1350,7 +1574,9 @@ fn resolve_tracks(
                     // back to a character-count estimate.
                     let measured = col_content.get(index).copied().flatten();
                     let estimate = col_chars.get(index).copied().unwrap_or(0) as f64 * 5.25;
-                    fixed.push(Some(measured.unwrap_or(estimate) + 20.0));
+                    // Typst's 7pt inset on either side is part of the track;
+                    // leave one point for Word's differing text metrics.
+                    fixed.push(Some(measured.unwrap_or(estimate) + 15.0));
                     flex.push(0.0);
                 }
                 index += 1;
@@ -1474,6 +1700,37 @@ fn parse_hr_style(style: &str) -> (f64, String) {
         }
     }
     (thickness, color)
+}
+
+fn parse_pt_property(style: &str, property: &str) -> Option<i64> {
+    style.split(';').find_map(|declaration| {
+        declaration.trim().strip_prefix(property)?.trim().strip_suffix("pt")?
+            .trim().parse::<f64>().ok().map(|pt| (pt * 20.0).round() as i64)
+    })
+}
+
+/// Extract Typst's generated decimal caption prefix (e.g. `Table 1: ...`).
+/// Leave custom numbering patterns and unnumbered captions as literal text.
+fn caption_number(runs: &[Run]) -> Option<(usize, String, u64)> {
+    for (index, run) in runs.iter().enumerate().skip(1) {
+        if run.text.is_empty()
+            || (run.text.len() > 1 && run.text.starts_with('0'))
+            || !run.text.bytes().all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        let label = runs[..index].iter().map(|run| run.text.as_str()).collect::<String>();
+        let label = label.trim();
+        let following = runs[index + 1..].iter().map(|run| run.text.as_str()).collect::<String>();
+        // A numbering pattern such as `1.1` cannot be represented by a simple
+        // SEQ field. Do not turn its first component into a separate counter.
+        let decimal_continues = following.strip_prefix('.')
+            .is_some_and(|tail| tail.chars().next().is_some_and(|c| c.is_ascii_digit()));
+        if !decimal_continues && !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return Some((index, label.to_string(), run.text.parse().ok()?));
+        }
+    }
+    None
 }
 
 /// Parse a CSS `padding` declaration (`T R B L` in pt) into twips.
@@ -1833,6 +2090,7 @@ fn package(
     write(&mut zip, "word/document.xml", document_xml)?;
     write(&mut zip, "word/styles.xml", styles)?;
     write(&mut zip, "word/numbering.xml", numbering)?;
+    write(&mut zip, "word/settings.xml", r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:updateFields w:val="true"/></w:settings>"#)?;
     write(
         &mut zip,
         "word/_rels/document.xml.rels",
@@ -1875,6 +2133,7 @@ fn content_types(header: bool, footer: bool, images: &[Media], footnotes: bool) 
 <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
 <Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>"#,
     );
+    out.push_str("<Override PartName=\"/word/settings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>");
     if header {
         out.push_str("<Override PartName=\"/word/header1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>");
     }
@@ -1912,6 +2171,7 @@ fn document_rels(
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"#,
     );
+    out.push_str("<Relationship Id=\"rId6\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings\" Target=\"settings.xml\"/>");
     if header {
         out.push_str("<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header1.xml\"/>");
     }
@@ -2106,19 +2366,19 @@ const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="29"/><w:qFormat/>
 <w:pPr><w:ind w:left="567"/></w:pPr><w:rPr><w:i/><w:color w:val="5A6B7B"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="Caption"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="35"/><w:qFormat/>
-<w:pPr><w:spacing w:after="160"/></w:pPr><w:rPr><w:i/><w:color w:val="5A6B7B"/><w:sz w:val="18"/></w:rPr></w:style>
+<w:pPr><w:spacing w:after="0"/></w:pPr></w:style>
 <w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="30"/><w:qFormat/>
 <w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="34"/><w:qFormat/>
 <w:pPr><w:ind w:left="720"/></w:pPr></w:style>
 <w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:uiPriority w:val="39"/><w:qFormat/>
 <w:tblPr><w:tblBorders>
-<w:top w:val="single" w:sz="4" w:space="0" w:color="B7C4D0"/>
-<w:left w:val="single" w:sz="4" w:space="0" w:color="B7C4D0"/>
-<w:bottom w:val="single" w:sz="4" w:space="0" w:color="B7C4D0"/>
-<w:right w:val="single" w:sz="4" w:space="0" w:color="B7C4D0"/>
-<w:insideH w:val="single" w:sz="4" w:space="0" w:color="B7C4D0"/>
-<w:insideV w:val="single" w:sz="4" w:space="0" w:color="B7C4D0"/>
+<w:top w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+<w:left w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+<w:bottom w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+<w:right w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+<w:insideH w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+<w:insideV w:val="single" w:sz="8" w:space="0" w:color="000000"/>
 </w:tblBorders></w:tblPr></w:style>
 </w:styles>"#;
 

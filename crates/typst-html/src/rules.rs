@@ -97,8 +97,13 @@ pub fn register(rules: &mut NativeRuleMap) {
     rules.register::<FrameElem>(Paged, |elem, _, _| Ok(elem.body.clone()));
 }
 
-const PAR_RULE: ShowFn<ParElem> =
-    |elem, _, _| Ok(HtmlElem::new(tag::p).with_body(Some(elem.body.clone())).pack());
+const PAR_RULE: ShowFn<ParElem> = |elem, _, styles| {
+    let mut paragraph = HtmlElem::new(tag::p).with_body(Some(elem.body.clone()));
+    if elem.justify.get(styles) {
+        paragraph = paragraph.with_attr(attr::style, "text-align: justify");
+    }
+    Ok(paragraph.pack())
+};
 
 const STRONG_RULE: ShowFn<StrongElem> =
     |elem, _, _| Ok(HtmlElem::new(tag::strong).with_body(Some(elem.body.clone())).pack());
@@ -313,6 +318,8 @@ const HEADING_RULE: ShowFn<HeadingElem> = |elem, engine, styles| {
 
 const FIGURE_RULE: ShowFn<FigureElem> = |elem, _, styles| {
     let span = elem.span();
+    let gap = elem.gap.get(styles);
+    let gap_pt = gap.abs.to_pt() + gap.em.get() * 10.5;
     let mut realized = elem.body.clone();
 
     // Build the caption, if any.
@@ -328,6 +335,7 @@ const FIGURE_RULE: ShowFn<FigureElem> = |elem, _, styles| {
 
     Ok(BlockElem::packed(
         HtmlElem::new(tag::figure)
+            .with_attr(attr::style, eco_format!("text-align: center; figure-gap: {gap_pt}pt"))
             .with_body(Some(realized))
             .pack()
             .spanned(elem.span()),
@@ -335,8 +343,15 @@ const FIGURE_RULE: ShowFn<FigureElem> = |elem, _, styles| {
 };
 
 const FIGURE_CAPTION_RULE: ShowFn<FigureCaption> = |elem, engine, styles| {
+    let numbered = elem.numbering.as_ref().is_some_and(Option::is_some)
+        && elem.counter.as_ref().is_some_and(Option::is_some)
+        && elem.supplement.as_ref().is_some_and(Option::is_some);
+    let mut caption = HtmlElem::new(tag::figcaption);
+    if numbered {
+        caption = caption.with_attr(attr::class, "typst-numbered-caption");
+    }
     Ok(BlockElem::packed(
-        HtmlElem::new(tag::figcaption)
+        caption
             .with_body(Some(elem.realize(engine, styles)?))
             .pack()
             .spanned(elem.span()),
@@ -664,6 +679,10 @@ fn column_align(align: &Celled<Smart<Alignment>>, column: usize) -> &'static str
         Celled::Array(array) if !array.is_empty() => array[column % array.len()].clone(),
         _ => Smart::Auto,
     };
+    alignment_css(&value)
+}
+
+fn alignment_css(value: &Smart<Alignment>) -> &'static str {
     match value {
         Smart::Custom(alignment) => match alignment.x() {
             Some(HAlignment::Center) => "center",
@@ -834,11 +853,20 @@ fn show_cell(
     padding: &str,
 ) -> Content {
     let body = cell.body.clone();
+    let cell_align = body
+        .to_packed::<TableCell>()
+        .map(|cell| alignment_css(&cell.align.get(styles)))
+        .or_else(|| {
+            body.to_packed::<GridCell>()
+                .map(|cell| alignment_css(&cell.align.get(styles)))
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or(align);
     let span = |n: NonZeroUsize| (n != NonZeroUsize::MIN).then(|| n.to_string());
     let mut attrs = HtmlAttrs::new();
     let mut style = String::new();
-    if !align.is_empty() {
-        style.push_str(&eco_format!("text-align: {align}; "));
+    if !cell_align.is_empty() {
+        style.push_str(&eco_format!("text-align: {cell_align}; "));
     }
     if !padding.is_empty() {
         style.push_str(&eco_format!("padding: {padding}"));

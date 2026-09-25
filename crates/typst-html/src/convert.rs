@@ -4,8 +4,9 @@ use typst_library::engine::Engine;
 use typst_library::foundations::{Content, Packed, StyleChain, Target, TargetElem};
 use typst_library::introspection::{SplitLocator, TagElem};
 use typst_library::layout::{
-    Abs, Axes, BlockBody, BlockElem, BoxElem, HElem, Region, Size,
+    Abs, Axes, BlockBody, BlockElem, BoxElem, HElem, Length, Region, Rel, Size,
 };
+use typst_library::visualize::Paint;
 use typst_library::routines::Pair;
 use typst_library::text::{
     LinebreakElem, SmartQuoteElem, SmartQuoter, SmartQuotes, SpaceElem, TextElem,
@@ -340,6 +341,8 @@ fn handle_box(
     styles: StyleChain,
 ) -> SourceResult<()> {
     let mut children = EcoVec::new();
+    let fill = elem.fill.get_cloned(styles);
+    let has_fill = matches!(fill, Some(Paint::Solid(_)));
     if let Some(body) = elem.body.get_ref(styles) {
         children = html_inline_fragment(
             converter.engine,
@@ -350,17 +353,24 @@ fn handle_box(
             converter.whitespace,
         )?;
 
-        if let Some(node) = to_lone_element(&mut children) {
+        if !has_fill && let Some(node) = to_lone_element(&mut children) {
             make_inline_level(node);
             converter.extend(children);
             return Ok(());
         }
     }
 
+    let mut properties = css::Properties::new().with("display", "inline-block");
+    if let Some(Paint::Solid(color)) = fill {
+        properties = properties.with("background-color", color.to_hex());
+    }
+    let inset = elem.inset.get_cloned(styles);
+    let points = |side: Option<Rel<Length>>| side.map(|v| v.relative_to(Length::zero()).abs.to_pt()).unwrap_or(0.0);
+    properties = properties.with("padding", format!("{}pt {}pt {}pt {}pt", points(inset.top), points(inset.right), points(inset.bottom), points(inset.left)));
     converter.push(
         // TODO: This is rather incomplete.
         HtmlElement::new(tag::span)
-            .with_css(css::Properties::new().with("display", "inline-block"))
+            .with_css(properties)
             .with_children(children)
             .spanned(elem.span()),
     );
