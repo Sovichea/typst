@@ -85,6 +85,7 @@ pub const controls: HtmlAttr = HtmlAttr::constant("controls");
 pub const coords: HtmlAttr = HtmlAttr::constant("coords");
 pub const crossorigin: HtmlAttr = HtmlAttr::constant("crossorigin");
 pub const data: HtmlAttr = HtmlAttr::constant("data");
+pub const data_typst_equation_number: HtmlAttr = HtmlAttr::constant("data-eqn-num");
 pub const datetime: HtmlAttr = HtmlAttr::constant("datetime");
 pub const decoding: HtmlAttr = HtmlAttr::constant("decoding");
 pub const default: HtmlAttr = HtmlAttr::constant("default");

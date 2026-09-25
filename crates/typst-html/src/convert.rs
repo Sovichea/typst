@@ -367,6 +367,22 @@ fn handle_box(
     let inset = elem.inset.get_cloned(styles);
     let points = |side: Option<Rel<Length>>| side.map(|v| v.relative_to(Length::zero()).abs.to_pt()).unwrap_or(0.0);
     properties = properties.with("padding", format!("{}pt {}pt {}pt {}pt", points(inset.top), points(inset.right), points(inset.bottom), points(inset.left)));
+    let radius = elem.radius.get_cloned(styles);
+    let radius_point = |value: Option<Rel<Length>>| {
+        value.map(|v| v.relative_to(Length::zero()).abs.to_pt()).unwrap_or(0.0)
+    };
+    let radius = [
+        radius_point(radius.top_left),
+        radius_point(radius.top_right),
+        radius_point(radius.bottom_right),
+        radius_point(radius.bottom_left),
+    ];
+    if radius.iter().any(|value| *value > 0.0) {
+        properties = properties.with(
+            "border-radius",
+            format!("{}pt {}pt {}pt {}pt", radius[0], radius[1], radius[2], radius[3]),
+        );
+    }
     converter.push(
         // TODO: This is rather incomplete.
         HtmlElement::new(tag::span)

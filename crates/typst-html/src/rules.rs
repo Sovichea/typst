@@ -1049,11 +1049,27 @@ const EQUATION_RULE: ShowFn<EquationElem> = |elem, engine, styles| {
 
     let block = elem.block.get(styles);
     let body = convert_math_to_nodes(item, engine, styles, block)?;
-    let math = HtmlElem::new(tag::mathml::math)
+    let span = elem.span();
+    let number = if block {
+        elem.numbering
+            .get_ref(styles)
+            .as_ref()
+            .map(|numbering| {
+                Counter::of(EquationElem::ELEM)
+                    .display_at(engine, elem.location().unwrap(), styles, numbering, span)
+                    .map(|content| content.plain_text())
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let mut math = HtmlElem::new(tag::mathml::math)
         .with_body(Some(Content::sequence(body)))
-        .with_optional_attr(attr::mathml::display, block.then_some("block"))
-        .pack()
-        .spanned(elem.span());
+        .with_optional_attr(attr::mathml::display, block.then_some("block"));
+    if let Some(number) = number {
+        math = math.with_attr(attr::data_typst_equation_number, number);
+    }
+    let math = math.pack().spanned(span);
 
     Ok(if block { BlockElem::packed(math) } else { math })
 };

@@ -454,6 +454,7 @@ struct Emitter<'a> {
     layout_images: Vec<layout::ImageInfo>,
     /// Next unconsumed layout image.
     image_cursor: usize,
+    next_drawing_id: u32,
     /// Embedded image parts collected while emitting.
     images: Vec<Media>,
     /// External hyperlink targets, in order of first use.
@@ -503,6 +504,7 @@ impl Emitter<'_> {
             current_typo: None,
             layout_images,
             image_cursor: 0,
+            next_drawing_id: 1,
             images: Vec::new(),
             hyperlinks: Vec::new(),
             footnotes,
@@ -596,14 +598,9 @@ impl Emitter<'_> {
             }
             self.paragraph("Quote", &runs, None);
         } else if t == tag::pre {
-            let runs = inline(&el.children, false, false, true, None);
-            self.paragraph("Code", &runs, None);
+            self.raw_block(el);
         } else if t == tag::mathml::math {
-            self.out.push_str("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/><w:jc w:val=\"center\"/></w:pPr><m:oMathPara><m:oMath>");
-            for child in &el.children {
-                self.out.push_str(&omml_node(child));
-            }
-            self.out.push_str("</m:oMath></m:oMathPara></w:p>");
+            self.display_equation(el);
         } else if t == tag::figcaption || t == tag::caption {
             let runs = inline(&el.children, false, false, false, None);
             if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-numbered-caption") {
@@ -1167,6 +1164,8 @@ impl Emitter<'_> {
 
         let ext = mime_to_ext(mime);
         let index = self.images.len() + 1;
+        let drawing_id = self.next_drawing_id;
+        self.next_drawing_id += 1;
         let rel_id = format!("rId{}", 100 + index);
         self.images.push(Media {
             rel_id: rel_id.clone(),
@@ -1193,11 +1192,11 @@ impl Emitter<'_> {
              xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
              distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
              <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
-             <wp:docPr id=\"{index}\" name=\"Picture {index}\"/>\
+              <wp:docPr id=\"{drawing_id}\" name=\"Picture {index}\"/>\
              <a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
              <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
              <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
-             <pic:nvPicPr><pic:cNvPr id=\"{index}\" name=\"Picture {index}\"/>\
+              <pic:nvPicPr><pic:cNvPr id=\"{drawing_id}\" name=\"Picture {index}\"/>\
              <pic:cNvPicPr/></pic:nvPicPr>\
              <pic:blipFill><a:blip r:embed=\"{rel_id}\"/>\
              <a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
@@ -1207,35 +1206,134 @@ impl Emitter<'_> {
         ));
     }
 
-    /// A filled Typst box is a one-cell borderless table in Word. This keeps
-    /// its background and inset together when the text wraps across lines.
+    fn raw_block(&mut self, el: &HtmlElement) {
+        let width = (self.content_width_pt * 20.0).round() as i64;
+        self.out.push_str(&format!(
+            "<w:tbl><w:tblPr><w:tblW w:w=\"{width}\" w:type=\"dxa\"/>\
+             <w:jc w:val=\"left\"/><w:tblInd w:w=\"0\" w:type=\"dxa\"/>\
+             <w:tblLayout w:type=\"fixed\"/><w:tblBorders>\
+             <w:top w:val=\"nil\"/><w:left w:val=\"nil\"/><w:bottom w:val=\"nil\"/><w:right w:val=\"nil\"/>\
+             </w:tblBorders><w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
+             <w:left w:w=\"0\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/>\
+             <w:right w:w=\"0\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr>\
+             <w:tblGrid><w:gridCol w:w=\"{width}\"/></w:tblGrid><w:tr><w:tc>\
+             <w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/><w:tcBorders>\
+             <w:top w:val=\"nil\"/><w:left w:val=\"nil\"/><w:bottom w:val=\"nil\"/><w:right w:val=\"nil\"/>\
+             </w:tcBorders><w:tcMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
+             <w:left w:w=\"0\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/>\
+             <w:right w:w=\"0\" w:type=\"dxa\"/></w:tcMar></w:tcPr>"
+        ));
+        let runs = inline(&el.children, false, false, true, None);
+        let previous_align = self.align.replace("left".into());
+        let previous_in_cell = self.in_cell;
+        self.in_cell = true;
+        self.paragraph("Code", &runs, None);
+        self.align = previous_align;
+        self.in_cell = previous_in_cell;
+        self.out.push_str("</w:tc></w:tr></w:tbl>");
+    }
+
+    fn display_equation(&mut self, el: &HtmlElement) {
+        let total = (self.content_width_pt * 20.0).round() as i64;
+        let side = (total as f64 * 0.2).round() as i64;
+        let center = total - 2 * side;
+        let cell = |width: i64| {
+            format!(
+                "<w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/><w:tcBorders>\
+                 <w:top w:val=\"nil\"/><w:left w:val=\"nil\"/><w:bottom w:val=\"nil\"/><w:right w:val=\"nil\"/>\
+                 </w:tcBorders><w:tcMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
+                 <w:left w:w=\"0\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/>\
+                 <w:right w:w=\"0\" w:type=\"dxa\"/></w:tcMar><w:vAlign w:val=\"center\"/></w:tcPr>"
+            )
+        };
+        self.out.push_str(&format!(
+            "<w:tbl><w:tblPr><w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
+             <w:jc w:val=\"center\"/><w:tblInd w:w=\"0\" w:type=\"dxa\"/>\
+             <w:tblLayout w:type=\"fixed\"/><w:tblBorders>\
+             <w:top w:val=\"nil\"/><w:left w:val=\"nil\"/><w:bottom w:val=\"nil\"/><w:right w:val=\"nil\"/>\
+             </w:tblBorders><w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
+             <w:left w:w=\"0\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/>\
+             <w:right w:w=\"0\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr>\
+             <w:tblGrid><w:gridCol w:w=\"{side}\"/><w:gridCol w:w=\"{center}\"/>\
+             <w:gridCol w:w=\"{side}\"/></w:tblGrid><w:tr><w:trPr><w:cantSplit/></w:trPr>"
+        ));
+        self.out.push_str(&format!(
+            "<w:tc>{}<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/>\
+             <w:jc w:val=\"center\"/></w:pPr></w:p></w:tc>",
+            cell(side)
+        ));
+        self.out.push_str(&format!(
+            "<w:tc>{}<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/>\
+             <w:jc w:val=\"center\"/></w:pPr><m:oMath>",
+            cell(center)
+        ));
+        for child in &el.children {
+            self.out.push_str(&omml_node(child));
+        }
+        self.out.push_str("</m:oMath></w:p></w:tc>");
+        self.out.push_str(&format!(
+            "<w:tc>{}<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/>\
+             <w:jc w:val=\"right\"/></w:pPr>{}</w:p></w:tc></w:tr></w:tbl>",
+            cell(side),
+            el.attrs
+                .get(attr::data_typst_equation_number)
+                .filter(|number| !number.is_empty())
+                .map(|number| {
+                    format!(
+                        "<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                        escape_xml(number)
+                    )
+                })
+                .unwrap_or_default()
+        ));
+    }
+
     fn filled_box(&mut self, el: &HtmlElement) {
         let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
         let color = style.split(';').find_map(|part| part.trim().strip_prefix("background-color:"))
             .map(|value| value.trim().trim_start_matches('#').to_ascii_uppercase())
             .unwrap_or_else(|| "FFFFFF".into());
         let (top, right, bottom, left) = parse_padding(style).unwrap_or((0, 0, 0, 0));
-        let width = (self.content_width_pt * 20.0).round() as i64;
+        let radius_pt = {
+            let radius = parse_radius(style);
+            if radius > 0.0 { radius } else { 4.0 }
+        };
+        let available_width = (self.content_width_pt - (left + right) as f64 / 20.0).max(1.0);
+        let line_count = ((text_len(el) as f64 * 5.25 / available_width).ceil() as i64).max(1);
+        let height_twips = top + bottom + line_count * 210;
+        let width_emu = (self.content_width_pt * 12700.0).round() as i64;
+        let height_emu = (height_twips as f64 * 635.0).round() as i64;
+        let top_emu = top * 635;
+        let right_emu = right * 635;
+        let bottom_emu = bottom * 635;
+        let left_emu = left * 635;
+        let height_pt = height_twips as f64 / 20.0;
+        let adjustment = ((100000.0 * radius_pt / self.content_width_pt.min(height_pt)).round() as i64)
+            .clamp(0, 50000);
+        let drawing_id = self.next_drawing_id;
+        self.next_drawing_id += 1;
+        let align = self.align.as_deref().unwrap_or("left");
         self.out.push_str(&format!(
-            "<w:tbl><w:tblPr><w:tblW w:w=\"{width}\" w:type=\"dxa\"/>\
-             <w:jc w:val=\"left\"/><w:tblInd w:w=\"{left}\" w:type=\"dxa\"/>\
-             <w:tblLayout w:type=\"fixed\"/><w:tblBorders><w:top w:val=\"nil\"/>\
-             <w:bottom w:val=\"nil\"/><w:left w:val=\"nil\"/><w:right w:val=\"nil\"/>\
-             </w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w=\"{width}\"/></w:tblGrid>\
-             <w:tr><w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>\
-             <w:shd w:val=\"clear\" w:fill=\"{color}\"/>\
-             <w:tcMar><w:top w:w=\"{top}\" w:type=\"dxa\"/>\
-             <w:right w:w=\"{right}\" w:type=\"dxa\"/>\
-             <w:bottom w:w=\"{bottom}\" w:type=\"dxa\"/>\
-             <w:left w:w=\"{left}\" w:type=\"dxa\"/></w:tcMar></w:tcPr>"
+            r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:jc w:val="{align}"/></w:pPr><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{width_emu}" cy="{height_emu}"/><wp:docPr id="{drawing_id}" name="Rounded Rectangle {drawing_id}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width_emu}" cy="{height_emu}"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val {adjustment}"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="{color}"/></a:solidFill><a:ln><a:noFill/></a:ln></wps:spPr><wps:txbx><w:txbxContent>"#,
+            align = align,
+            width_emu = width_emu,
+            height_emu = height_emu,
+            drawing_id = drawing_id,
+            adjustment = adjustment,
+            color = color,
         ));
         let runs = inline(&el.children, false, false, false, None);
+        let previous_in_cell = self.in_cell;
         self.in_cell = true;
         self.paragraph("Normal", &runs, None);
-        self.in_cell = false;
-        self.out.push_str("</w:tc></w:tr></w:tbl>");
-        // Typst leaves block space after a filled box. The measured heading
-        // styles have no `before` spacing, so preserve that gap explicitly.
+        self.in_cell = previous_in_cell;
+        self.out.push_str(&format!(
+            r#"</w:txbxContent></wps:txbx><wps:bodyPr rot="0" spcFirstLastPara="0" vertOverflow="overflow" horzOverflow="overflow" vert="horz" wrap="square" lIns="{left_emu}" tIns="{top_emu}" rIns="{right_emu}" bIns="{bottom_emu}" numCol="1" spcCol="0" rtlCol="0" fromWordArt="0" anchor="t" anchorCtr="0" forceAA="0" compatLnSpc="1"><a:prstTxWarp prst="textNoShape"><a:avLst/></a:prstTxWarp><a:spAutoFit/></wps:bodyPr></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+            left_emu = left_emu,
+            top_emu = top_emu,
+            right_emu = right_emu,
+            bottom_emu = bottom_emu,
+        ));
         self.out.push_str("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"exact\"/></w:pPr></w:p>");
     }
 
@@ -1814,6 +1912,16 @@ fn parse_padding(style: &str) -> Option<(i64, i64, i64, i64)> {
         }
     }
     None
+}
+
+fn parse_radius(style: &str) -> f64 {
+    style
+        .split(';')
+        .find_map(|declaration| declaration.trim().strip_prefix("border-radius:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.strip_suffix("pt"))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0.0)
 }
 
 /// Map a CSS `text-align` declaration to a Word `w:jc` value.
