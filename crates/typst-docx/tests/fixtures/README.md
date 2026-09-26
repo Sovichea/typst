@@ -1,5 +1,8 @@
 # Typst → DOCX benchmark
 
+The converter-first roadmap and fidelity acceptance gates are in the
+[implementation plan](../../IMPLEMENTATION_PLAN.md).
+
 Two feature-dense Typst documents (`benchmark.typ` and `complex-benchmark.typ`)
 regression-check the conversion pipeline. Compare the generated DOCX structure
 and geometry to the corresponding Typst PDF/layout reference during tool
@@ -74,11 +77,12 @@ The document deliberately exercises:
 | **Multi-line headings / letterheads** | ✅ | ✅ | `<br>` → `<w:br/>`, inline size/color, `#align` → centered |
 | **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |
 | **Images** | ✅ | ✅ | embedded from the `<img>` data URI, sized from the layout |
-| **Math** | ✅ | ❌ | MathML not converted |
+| **Math** | ✅ | Partial | OMML fractions, scripts and radicals; equation numbering uses a borderless grid. Complex constructs need coverage checks. |
 | **Footnotes** | ✅ | ✅ | endnotes section → `word/footnotes.xml` + `w:footnoteReference` (content formatting is plain) |
 | **Hyperlinks** | ✅ | ✅ | external `http(s)` links → `w:hyperlink` + external rel (internal/TOC links not yet) |
 
-Bold entries are the current known gaps surfaced by this benchmark.
+This table describes `benchmark.typ`; `complex-benchmark.typ` exercises the
+additional column, float and SVG coverage described below.
 
 ### Multi-line headings / body letterheads
 
@@ -116,6 +120,7 @@ with the `html` feature (it makes `html.frame` available even for PDF):
 ```sh
 FIX=crates/typst-docx/tests/fixtures/complex-benchmark.typ
 target/debug/typst compile --features html "$FIX" /tmp/complex.pdf
+target/debug/typst compile --format layout --features html "$FIX" /tmp/complex.layout.json
 target/debug/typst compile --format docx --features html "$FIX" /tmp/complex.docx
 ```
 
