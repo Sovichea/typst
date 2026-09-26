@@ -125,9 +125,12 @@ target/debug/typst compile --format docx --features html "$FIX" /tmp/complex.doc
 ```
 
 The SVGs are embedded in the generated DOCX, not stored as replacement assets
-in the Typst source. The converter currently drops Typst `columns` during HTML
-export, so this benchmark also serves as a source-text coverage check: successful
-compilation alone does not mean multi-column prose survived in DOCX.
+in the Typst source. The converter now retains `#columns` content and explicit
+`#colbreak()` boundaries as native text in a borderless fixed-width layout grid;
+check its column spacing in Typsastra Office against the PDF. Auto-flow without
+explicit column breaks, multi-page columns, and floating `#place` content are
+not yet represented faithfully. Page drift remains even when all column text is
+present, so successful compilation alone does not establish visual fidelity.
 
 ### Horizontal rules
 

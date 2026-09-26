@@ -21,5 +21,8 @@ ecow = { workspace = true }
 zip = { workspace = true }
 base64 = { workspace = true }
 
+[dev-dependencies]
+typst-syntax = { workspace = true }
+
 [lints]
 workspace = true

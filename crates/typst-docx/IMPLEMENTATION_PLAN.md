@@ -35,10 +35,12 @@ Typst source ─┬─ paged layout ── PDF reference + geometry/style sample
 - `typst-docx` emits WordprocessingML and package parts. `html.frame` exposes an
   evaluated CeTZ canvas to the HTML DOM; the exporter places its SVG in DOCX
   media and leaves the authored CeTZ code in Typst.
-- Semantic HTML currently ignores `columns`, `place`, and some spacing. The
-  `complex-benchmark.typ` PDF contains multi-column prose and a floating
-  thumbnail that do not fully survive DOCX export. These are **open blockers**,
-  not acceptable fallbacks or proof of overall fidelity.
+- Semantic HTML now retains `#columns` bodies and explicit `#colbreak()` markers;
+  the DOCX exporter uses a borderless fixed-width grid for these bounded
+  groups. Automatic and multi-page column flow remain incomplete. HTML still
+  ignores `#place` and some spacing: the complex benchmark's floating thumbnail
+  is absent and the final section begins on a different page in the dev editor
+  than in the PDF. These are **open blockers**, not proof of overall fidelity.
 
 ## Per-element export contract
 
@@ -105,13 +107,14 @@ Typst IR or a runtime prerequisite for export.
 - Define the object map, measurement units, tolerance policy and diagnostic
   format. Start with content coverage before tuning visual offsets.
 
-**Exit:** the harness identifies the currently missing column text and float;
+**Exit:** the harness verifies retained explicit-column text and identifies
+the missing float, automatic column-flow limits, and observed page drift;
 unknown geometry is reported as unknown, not a passing comparison.
 
 ### 1. Complete semantic coverage
 
-- Preserve `columns` bodies and `colbreak` boundaries in the semantic path and
-  export a Word representation with the correct count, gutter, flow and order.
+- Extend the current explicit-column grid to handle automatic and multi-page
+  column flow; preserve gutter, order, and the page-level `columns` setting.
 - Preserve explicit page breaks and positioned/floating image content; do not
   conflate the body flow with header/footer or decorative frames.
 - Reconcile the fixture status table with current math, caption and callout

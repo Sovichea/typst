@@ -388,6 +388,7 @@ struct Typography {
 struct Block {
     style: String,
     text: String,
+    in_columns: bool,
 }
 
 /// An embedded image part.
@@ -420,6 +421,8 @@ struct Emitter<'a> {
     align: Option<String>,
     figure_gap: Option<i64>,
     in_cell: bool,
+    in_columns: bool,
+    column_start: bool,
     /// The numbered run in the caption currently being emitted, if any.
     caption_seq: Option<(usize, String)>,
     caption_counters: HashMap<String, u64>,
@@ -488,6 +491,8 @@ impl Emitter<'_> {
             align: None,
             figure_gap: None,
             in_cell: false,
+            in_columns: false,
+            column_start: false,
             caption_seq: None,
             caption_counters: HashMap::new(),
             next_num_id: 100,
@@ -628,6 +633,11 @@ impl Emitter<'_> {
             }
         } else if t == tag::table {
             self.table(el);
+        } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-columns") {
+            self.columns(el);
+        } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-colbreak") {
+            let kind = if self.in_columns { "column" } else { "page" };
+            self.out.push_str(&format!("<w:p><w:r><w:br w:type=\"{kind}\"/></w:r></w:p>"));
         } else if t == tag::span
             && el.attrs.get(attr::style).is_some_and(|style| style.contains("background-color:"))
         {
@@ -689,11 +699,15 @@ impl Emitter<'_> {
         self.blocks.push(Block {
             style: style.to_string(),
             text: runs.iter().map(|r| r.text.as_str()).collect(),
+            in_columns: self.in_columns,
         });
         self.out.push_str("<w:p><w:pPr>");
         self.out
             .push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
-        if style == "Heading2"
+        if self.in_columns && self.column_start {
+            self.out.push_str("<w:spacing w:before=\"0\"/>");
+            self.column_start = false;
+        } else if style == "Heading2"
             && self.blocks.get(self.blocks.len().saturating_sub(2))
                 .is_some_and(|previous| previous.style == "Heading1")
         {
@@ -1351,6 +1365,93 @@ impl Emitter<'_> {
         self.out.push_str("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"exact\"/></w:pPr></w:p>");
     }
 
+    fn columns(&mut self, el: &HtmlElement) {
+        let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
+        let (count, gap_pt) = parse_columns_style(style, self.content_width_pt);
+        if count < 2 {
+            for child in &el.children {
+                self.block(child);
+            }
+            return;
+        }
+
+        let mut groups: Vec<Vec<&HtmlNode>> = vec![Vec::new()];
+        for child in &el.children {
+            if matches!(child, HtmlNode::Element(break_el) if break_el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-colbreak")) {
+                groups.push(Vec::new());
+            } else {
+                groups.last_mut().unwrap().push(child);
+            }
+        }
+
+        let total = (self.content_width_pt * 20.0).round().max(count as f64) as i64;
+        let gap = ((gap_pt * 20.0).round() as i64).clamp(0, (total - count as i64) / (count as i64 - 1));
+        let content = (total - gap * (count as i64 - 1)) / count as i64;
+        let left_gap = gap / 2;
+        let right_gap = gap - left_gap;
+        let mut tracks = (0..count)
+            .map(|index| {
+                content + (if index > 0 { left_gap } else { 0 })
+                    + (if index + 1 < count { right_gap } else { 0 })
+            })
+            .collect::<Vec<_>>();
+        let remainder = total - tracks.iter().sum::<i64>();
+        *tracks.last_mut().unwrap() += remainder;
+
+        self.out.push_str(&format!(
+            "<w:tbl><w:tblPr><w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
+             <w:tblInd w:w=\"0\" w:type=\"dxa\"/><w:tblLayout w:type=\"fixed\"/>\
+             <w:tblBorders><w:top w:val=\"nil\"/><w:left w:val=\"nil\"/>\
+             <w:bottom w:val=\"nil\"/><w:right w:val=\"nil\"/>\
+             <w:insideH w:val=\"nil\"/><w:insideV w:val=\"nil\"/></w:tblBorders>\
+             <w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
+             <w:left w:w=\"0\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/>\
+             <w:right w:w=\"0\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr><w:tblGrid>"
+        ));
+        for width in &tracks {
+            self.out.push_str(&format!("<w:gridCol w:w=\"{width}\"/>"));
+        }
+        self.out.push_str("</w:tblGrid>");
+
+        for row in groups.chunks(count) {
+            self.out.push_str("<w:tr>");
+            for index in 0..count {
+                let width = tracks[index];
+                let left = if index > 0 { left_gap } else { 0 };
+                let right = if index + 1 < count { right_gap } else { 0 };
+                self.out.push_str(&format!(
+                    "<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>\
+                     <w:tcMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
+                     <w:left w:w=\"{left}\" w:type=\"dxa\"/>\
+                     <w:bottom w:w=\"0\" w:type=\"dxa\"/>\
+                     <w:right w:w=\"{right}\" w:type=\"dxa\"/></w:tcMar>\
+                     <w:vAlign w:val=\"top\"/></w:tcPr>"
+                ));
+                let start = self.out.len();
+                if let Some(nodes) = row.get(index) {
+                    let previous_width = self.content_width_pt;
+                    let previous_columns = self.in_columns;
+                    let previous_start = self.column_start;
+                    self.content_width_pt = content as f64 / 20.0;
+                    self.in_columns = true;
+                    self.column_start = true;
+                    for node in nodes {
+                        self.block(node);
+                    }
+                    self.column_start = previous_start;
+                    self.in_columns = previous_columns;
+                    self.content_width_pt = previous_width;
+                }
+                if self.out.len() == start {
+                    self.out.push_str("<w:p/>");
+                }
+                self.out.push_str("</w:tc>");
+            }
+            self.out.push_str("</w:tr>");
+        }
+        self.out.push_str("</w:tbl>");
+    }
+
     fn table(&mut self, el: &HtmlElement) {
         let mut rows: Vec<&HtmlElement> = Vec::new();
         collect_rows(el, &mut rows);
@@ -1787,6 +1888,29 @@ fn resolve_tracks(
     (widths, (gap * 20.0).round() as i64)
 }
 
+fn parse_columns_style(style: &str, available_pt: f64) -> (usize, f64) {
+    let mut count = 1;
+    let mut gap = 0.0;
+    for declaration in style.split(';') {
+        let declaration = declaration.trim();
+        if let Some(value) = declaration.strip_prefix("column-count:") {
+            count = value.trim().parse::<usize>().unwrap_or(1).max(1);
+        } else if let Some(value) = declaration.strip_prefix("column-gap:") {
+            let value = value.trim();
+            let value = value.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')).unwrap_or(value);
+            for part in value.split('+') {
+                let part = part.trim();
+                if let Some(pt) = part.strip_suffix("pt") {
+                    gap += pt.trim().parse::<f64>().unwrap_or(0.0);
+                } else if let Some(percent) = part.strip_suffix('%') {
+                    gap += percent.trim().parse::<f64>().unwrap_or(0.0) * available_pt / 100.0;
+                }
+            }
+        }
+    }
+    (count, gap.max(0.0))
+}
+
 /// The first number in an element's descendant link text.
 fn element_number(el: &HtmlElement) -> Option<u32> {
     for child in &el.children {
@@ -2007,6 +2131,7 @@ fn compute_spacing(
     let mut line: HashMap<&str, Vec<f64>> = HashMap::new();
 
     for (index, block) in blocks.iter().enumerate() {
+        if block.in_columns { continue; }
         let Some(first) = firsts[index] else { continue };
         let Some(last) = block_last(runs, &firsts, index) else { continue };
         let style = block.style.as_str();
@@ -2024,6 +2149,7 @@ fn compute_spacing(
             }
         }
 
+        if blocks.get(index + 1).is_some_and(|next| next.in_columns) { continue; }
         let Some(next) = firsts.get(index + 1).copied().flatten() else { continue };
         if runs[next].page == runs[first].page {
             let top = runs[next].y_pt - runs[next].ascent_pt;
@@ -2611,4 +2737,46 @@ fn numbering(ordered_num_ids: &[u32], indent: i64) -> String {
     }
     out.push_str("</w:numbering>");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ecow::eco_vec;
+    use typst_syntax::Span;
+
+    fn text_element(tag_name: HtmlTag, text: &str) -> HtmlNode {
+        HtmlElement::new(tag_name)
+            .with_children(eco_vec![HtmlNode::text(text, Span::detached())])
+            .into()
+    }
+
+    #[test]
+    fn explicit_columns_preserve_text_and_gutter() {
+        let columns: HtmlNode = HtmlElement::new(tag::div)
+            .with_attr(attr::class, "typst-columns")
+            .with_attr(attr::style, "column-count: 2; column-gap: calc(12pt + 0%)")
+            .with_children(eco_vec![
+                text_element(tag::p, "First column body"),
+                HtmlElement::new(tag::div)
+                    .with_attr(attr::class, "typst-colbreak")
+                    .into(),
+                text_element(tag::h3, "Second column heading"),
+                text_element(tag::p, "Second column body"),
+            ])
+            .into();
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.block(&columns);
+
+        let cells: Vec<_> = em.out.split("<w:tc>").collect();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(em.out.matches("<w:tbl>").count(), 1);
+        assert_eq!(em.out.matches("<w:gridCol w:w=\"4500\"/>").count(), 2);
+        assert_eq!(em.out.matches("<w:t xml:space=\"preserve\">First column body</w:t>").count(), 1);
+        assert_eq!(em.out.matches("<w:t xml:space=\"preserve\">Second column body</w:t>").count(), 1);
+        assert!(cells[1].contains("First column body"));
+        assert!(!cells[1].contains("Second column heading"));
+        assert!(cells[2].contains("Second column heading"));
+        assert!(cells[2].contains("<w:pStyle w:val=\"Heading2\"/><w:spacing w:before=\"0\"/>"));
+    }
 }

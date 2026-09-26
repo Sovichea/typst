@@ -13,8 +13,8 @@ use typst_library::foundations::{
 };
 use typst_library::layout::resolve::{Cell, CellGrid, Entry, Header};
 use typst_library::layout::{
-    AlignElem, Alignment, BlockElem, Celled, GridCell, GridElem, HAlignment, HElem, Length,
-    OuterVAlignment, PagebreakElem, Rel, Sides, Sizing,
+    AlignElem, Alignment, BlockElem, Celled, ColbreakElem, ColumnsElem, GridCell, GridElem,
+    HAlignment, HElem, Length, OuterVAlignment, PagebreakElem, Rel, Sides, Sizing,
 };
 use typst_library::math::EquationElem;
 use typst_library::math::ir::resolve_equation;
@@ -29,7 +29,7 @@ use typst_library::model::{
 use typst_library::routines::Arenas;
 use typst_library::text::{
     HighlightElem, LinebreakElem, OverlineElem, RawElem, RawLine, SmallcapsElem,
-    SpaceElem, StrikeElem, SubElem, SuperElem, UnderlineElem,
+    SpaceElem, StrikeElem, SubElem, SuperElem, TextElem, UnderlineElem,
 };
 use typst_library::visualize::{Color, ImageElem, LineElem, Paint};
 use typst_syntax::Span;
@@ -70,6 +70,8 @@ pub fn register(rules: &mut NativeRuleMap) {
     rules.register(Html, TABLE_RULE);
     rules.register(Html, TABLE_CELL_RULE);
     rules.register(Html, GRID_RULE);
+    rules.register(Html, COLUMNS_RULE);
+    rules.register(Html, COLBREAK_RULE);
     rules.register(Html, LINE_RULE);
     rules.register(Html, PAGEBREAK_RULE);
     rules.register(Html, ALIGN_RULE);
@@ -246,6 +248,36 @@ const PAGEBREAK_RULE: ShowFn<PagebreakElem> = |elem, _, _| {
     Ok(BlockElem::packed(
         HtmlElem::new(tag::div)
             .with_attr(attr::class, "pagebreak")
+            .pack()
+            .spanned(elem.span()),
+    ))
+};
+
+/// Keep column content and explicit breaks in the semantic tree. The DOCX
+/// exporter can then place each column in a borderless layout grid.
+const COLUMNS_RULE: ShowFn<ColumnsElem> = |elem, _, styles| {
+    let gutter = elem.gutter.get(styles);
+    let style = eco_format!(
+        "column-count: {}; column-gap: calc({}pt + {}%)",
+        elem.count.get(styles).get(),
+        gutter.abs.abs.to_pt() + gutter.abs.em.get() * styles.resolve(TextElem::size).to_pt(),
+        gutter.rel.get() * 100.0,
+    );
+    Ok(BlockElem::packed(
+        HtmlElem::new(tag::div)
+            .with_attr(attr::class, "typst-columns")
+            .with_attr(attr::style, style)
+            .with_body(Some(elem.body.clone()))
+            .pack()
+            .spanned(elem.span()),
+    ))
+};
+
+const COLBREAK_RULE: ShowFn<ColbreakElem> = |elem, _, _| {
+    Ok(BlockElem::packed(
+        HtmlElem::new(tag::div)
+            .with_attr(attr::class, "typst-colbreak")
+            .with_attr(attr::style, "break-before: column")
             .pack()
             .spanned(elem.span()),
     ))
