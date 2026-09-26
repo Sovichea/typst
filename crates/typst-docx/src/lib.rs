@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
 use ecow::eco_format;
-use typst_html::{HtmlDocument, HtmlElement, HtmlNode, HtmlTag, attr, tag};
+use typst_html::{HtmlDocument, HtmlElement, HtmlFrame, HtmlNode, HtmlTag, attr, tag};
 use typst_library::diag::StrResult;
 use typst_library::layout::Abs;
 use typst_layout::PagedDocument;
@@ -525,6 +525,7 @@ impl Emitter<'_> {
     fn block(&mut self, node: &HtmlNode) {
         match node {
             HtmlNode::Element(el) => self.block_el(el),
+            HtmlNode::Frame(frame) => self.svg_frame(frame),
             HtmlNode::Text(text, _) => {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
@@ -1162,6 +1163,25 @@ impl Emitter<'_> {
             return;
         };
 
+        let (width, height) = self
+            .layout_images
+            .get(self.image_cursor)
+            .map(|image| (image.width_pt, image.height_pt))
+            .unwrap_or((100.0, 100.0));
+        self.image_cursor += 1;
+        self.embed_image(mime, bytes, width, height);
+    }
+
+    fn svg_frame(&mut self, frame: &HtmlFrame) {
+        let size = frame.inner.size();
+        if size.x.to_pt() <= 0.0 || size.y.to_pt() <= 0.0 {
+            return;
+        }
+        let svg = typst_svg::svg_frame(&frame.inner);
+        self.embed_image("image/svg+xml", svg.into_bytes(), size.x.to_pt(), size.y.to_pt());
+    }
+
+    fn embed_image(&mut self, mime: &str, bytes: Vec<u8>, width: f64, height: f64) {
         let ext = mime_to_ext(mime);
         let index = self.images.len() + 1;
         let drawing_id = self.next_drawing_id;
@@ -1175,12 +1195,6 @@ impl Emitter<'_> {
             content_type: mime.to_string(),
         });
 
-        let (width, height) = self
-            .layout_images
-            .get(self.image_cursor)
-            .map(|image| (image.width_pt, image.height_pt))
-            .unwrap_or((100.0, 100.0));
-        self.image_cursor += 1;
         let cx = (width * 12700.0).round() as i64;
         let cy = (height * 12700.0).round() as i64;
         let align = self.align.as_deref().unwrap_or("left");
@@ -1676,6 +1690,9 @@ fn collect_inline(
 /// Whether an element has any block-level child (so it isn't inline content).
 fn has_block_child(el: &HtmlElement) -> bool {
     el.children.iter().any(|child| {
+        if matches!(child, HtmlNode::Frame(_)) {
+            return true;
+        }
         matches!(child, HtmlNode::Element(e) if matches!(
             e.tag,
             tag::p | tag::div | tag::section | tag::table | tag::ul | tag::ol | tag::li

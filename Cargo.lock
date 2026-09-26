@@ -3276,6 +3276,7 @@ dependencies = [
  "typst-html",
  "typst-layout",
  "typst-library",
+ "typst-svg",
  "zip",
 ]
 

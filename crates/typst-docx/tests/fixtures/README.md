@@ -1,14 +1,16 @@
 # Typst → DOCX benchmark
 
-One stable, feature-dense Typst document (`benchmark.typ`) used to regression-check
-every stage of the conversion pipeline. Run it after each change and compare the
-outputs against the previous stage.
+Two feature-dense Typst documents (`benchmark.typ` and `complex-benchmark.typ`)
+regression-check the conversion pipeline. Compare the generated DOCX structure
+and geometry to the corresponding Typst PDF/layout reference during tool
+development.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `benchmark.typ` | The benchmark document (≈5 pages). |
+| `complex-benchmark.typ` | Textual Typst IR exercising CeTZ diagrams, chart, columns, floats, and equations. |
 | `energy-chart.png` | Chart image referenced by the document. |
 | `make_chart.py` | Regenerates `energy-chart.png` (Pillow). Committed output. |
 
@@ -104,6 +106,24 @@ widths and cell margins zeroed to match the grid's inset.
 
 Not yet emitted from a header: images.
 
+### Complex drawing benchmark
+
+The complex benchmark keeps all three CeTZ drawings as editable Typst code.
+`html.frame(cetz.canvas(...))` leaves the PDF appearance unchanged and exposes
+the evaluated frame as an SVG to the HTML/DOCX converter. Build both outputs
+with the `html` feature (it makes `html.frame` available even for PDF):
+
+```sh
+FIX=crates/typst-docx/tests/fixtures/complex-benchmark.typ
+target/debug/typst compile --features html "$FIX" /tmp/complex.pdf
+target/debug/typst compile --format docx --features html "$FIX" /tmp/complex.docx
+```
+
+The SVGs are embedded in the generated DOCX, not stored as replacement assets
+in the Typst source. The converter currently drops Typst `columns` during HTML
+export, so this benchmark also serves as a source-text coverage check: successful
+compilation alone does not mean multi-column prose survived in DOCX.
+
 ### Horizontal rules
 
 `#line(length: 100%)` is a stroked shape (not text), so it's recovered from the
@@ -111,4 +131,3 @@ layout (`Geometry::Line` with a horizontal direction) and emitted as an empty
 paragraph with a bottom border (`w:pBdr`), sized from the stroke thickness and
 color. In the body, rules are interleaved with the HTML-driven content by their
 vertical position.
-

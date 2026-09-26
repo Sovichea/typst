@@ -42,6 +42,20 @@ pub fn svg(page: &Page, opts: &SvgOptions) -> String {
     xml.end_document()
 }
 
+/// Export an evaluated frame as a standalone SVG image.
+///
+/// Unlike [`svg_in_html`], this has intrinsic dimensions and no HTML-specific
+/// styles, so it can be embedded as media in another document format.
+pub fn svg_frame(frame: &Frame) -> String {
+    let mut renderer = SVGRenderer::new();
+    let mut xml = XmlWriter::new(xml_options(false));
+    let mut svg = svg_header(&mut xml, frame.size());
+    let state = State::new(frame.size());
+    renderer.render_frame(&mut svg, &state, frame);
+    renderer.finalize(svg);
+    xml.end_document()
+}
+
 /// Export a page into an SVG file as part of a bundle.
 ///
 /// Takes additional `anchor` locations that will be serialized as linkable
