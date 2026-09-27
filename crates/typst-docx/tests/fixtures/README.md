@@ -65,19 +65,20 @@ The document deliberately exercises:
 
 | Feature | Layout oracle | DOCX | Notes |
 |---|---|---|---|
-| Headings / title / outline | ✅ | ✅ (title, H1–4) | outline becomes a list, not a TOC field |
+| Headings / title / outline | ✅ | ✅ (title, H1–4) | outline has a native updateable TOC field and cached entries |
 | Paragraphs & inline runs | ✅ | ✅ | bold/italic/code carried |
 | Tables (header, colspan) | ✅ | ✅ | column widths still fixed |
 | Typography (font/size/color) | ✅ | ✅ | measured from layout |
 | Page size & margins | ✅ | ✅ | from `#set page(...)` |
 | Block spacing & indent | ✅ | ✅ | space-below + left indent + line pitch (`w:line`, `atLeast`) |
 | Line pitch (intra-paragraph) | ✅ | ✅ | measured baseline-to-baseline; `atLeast` avoids clipping. Line *breaking* still follows Word |
-| Lists | ✅ | ✅ | numbered lists restart per list; measured indent; bullets/numbers via numbering.xml |
-| Outline (TOC) | ✅ | ✅ | rendered as plain indented paragraphs (no Word numbering — the numbers are already in the text) |
+| Lists and term lists | ✅ | ✅ | numbered lists restart per list; terms use a bold label, colon, tab stop, and hanging continuation |
+| Outline (TOC) | ✅ | ✅ | native Word TOC field with cached rendered entries |
 | **Multi-line headings / letterheads** | ✅ | ✅ | `<br>` → `<w:br/>`, inline size/color, `#align` → centered |
 | **Headers / footers** | ✅ | ✅ | `header-letterhead.typ`; text + measured spacing, `PAGE` field for a trailing page number |
 | **Images** | ✅ | ✅ | embedded from the `<img>` data URI, sized from the layout |
-| **Math** | ✅ | Partial | OMML fractions, scripts and radicals; equation numbering uses a borderless grid. Complex constructs need coverage checks. |
+| **Columns** | ✅ | ✅ | native Word continuous section columns; explicit breaks flow to the next column |
+| **Math** | ✅ | Partial | OMML n-ary limits, aligned arrays, matrices, fractions, scripts and radicals; equation numbering uses a borderless grid. Other MathML constructs need coverage checks. |
 | **Footnotes** | ✅ | ✅ | endnotes section → `word/footnotes.xml` + `w:footnoteReference` (content formatting is plain) |
 | **Hyperlinks** | ✅ | ✅ | external `http(s)` links → `w:hyperlink` + external rel (internal/TOC links not yet) |
 
@@ -125,12 +126,12 @@ target/debug/typst compile --format docx --features html "$FIX" /tmp/complex.doc
 ```
 
 The SVGs are embedded in the generated DOCX, not stored as replacement assets
-in the Typst source. The converter now retains `#columns` content and explicit
-`#colbreak()` boundaries as native text in a borderless fixed-width layout grid;
-check its column spacing in Typsastra Office against the PDF. Auto-flow without
-explicit column breaks, multi-page columns, and floating `#place` content are
-not yet represented faithfully. Page drift remains even when all column text is
-present, so successful compilation alone does not establish visual fidelity.
+in the Typst source. `#columns` becomes native continuous Word section columns,
+and `#colbreak()` starts the following paragraph in the next column. Filled grid
+boxes remain editable rounded shapes. Floating `#place` content is an anchored
+SVG with top-and-bottom text wrapping. Fractional vertical spacing and exact page/line
+reflow remain under qualification. Compile success alone does not establish
+visual fidelity; inspect the generated file in Typsastra Office against the PDF.
 
 ### Horizontal rules
 

@@ -14,7 +14,8 @@ the Typst source editable and the DOCX caption native.
 This phase does **not** implement an agent, DOCX → Typst import, or synchronization
 of user edits made after export. Those require a reliable exporter first and
 belong to the later agentic-editing plan in `DesktopEditors/docs/agentic-editing-plan.md`.
-Nor does this phase require a visual model or screenshots to judge an export.
+Rendered DOCX pages must also be opened and visually audited in the dev
+Typsastra Office build; OOXML validity alone does not qualify fidelity.
 
 "Accurate" means measured against a pinned reference, with explicit feature
 coverage and tolerances. Word and Typst use different layout engines, so an
@@ -35,12 +36,15 @@ Typst source ─┬─ paged layout ── PDF reference + geometry/style sample
 - `typst-docx` emits WordprocessingML and package parts. `html.frame` exposes an
   evaluated CeTZ canvas to the HTML DOM; the exporter places its SVG in DOCX
   media and leaves the authored CeTZ code in Typst.
-- Semantic HTML now retains `#columns` bodies and explicit `#colbreak()` markers;
-  the DOCX exporter uses a borderless fixed-width grid for these bounded
-  groups. Automatic and multi-page column flow remain incomplete. HTML still
-  ignores `#place` and some spacing: the complex benchmark's floating thumbnail
-  is absent and the final section begins on a different page in the dev editor
-  than in the PDF. These are **open blockers**, not proof of overall fidelity.
+- Semantic HTML retains `#columns` bodies, explicit `#colbreak()` markers, and
+  fixed vertical spacing. DOCX maps column groups to native continuous Word
+  section columns, while filled boxes in grids remain editable rounded shapes.
+- Floating `#place` content is exported as a rotated SVG DrawingML anchor with
+  top-and-bottom wrapping. Complex equations retain n-ary operators, aligned
+  arrays, and matrices as OMML; outlines have a native TOC field with a rendered
+  cached result. Word handles automatic and multi-page column flow; fractional
+  vertical spacing is still incomplete. Page/line reflow and every rendered
+  element remain under visual qualification against the same-source PDF.
 
 ## Per-element export contract
 
@@ -107,14 +111,14 @@ Typst IR or a runtime prerequisite for export.
 - Define the object map, measurement units, tolerance policy and diagnostic
   format. Start with content coverage before tuning visual offsets.
 
-**Exit:** the harness verifies retained explicit-column text and identifies
-the missing float, automatic column-flow limits, and observed page drift;
-unknown geometry is reported as unknown, not a passing comparison.
+**Exit:** the harness verifies retained explicit-column text and native column
+settings, and reports observed page drift; unknown geometry is reported as
+unknown, not a passing comparison.
 
 ### 1. Complete semantic coverage
 
-- Extend the current explicit-column grid to handle automatic and multi-page
-  column flow; preserve gutter, order, and the page-level `columns` setting.
+- Preserve native automatic and multi-page column flow; qualify gutter, order,
+  explicit breaks, and interactions with other section settings.
 - Preserve explicit page breaks and positioned/floating image content; do not
   conflate the body flow with header/footer or decorative frames.
 - Reconcile the fixture status table with current math, caption and callout

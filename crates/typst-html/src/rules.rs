@@ -8,13 +8,15 @@ use typst_library::diag::{At, warning};
 use typst_library::foundations::{
     Content, Context, NativeElement, NativeRuleMap, Selector, ShowFn, Smart, StyleChain,
     Target,
-};use typst_library::introspection::{
+};
+use typst_library::introspection::{
     Counter, DocumentIntrospection, Locator, QueryIntrospection,
 };
 use typst_library::layout::resolve::{Cell, CellGrid, Entry, Header};
 use typst_library::layout::{
-    AlignElem, Alignment, BlockElem, Celled, ColbreakElem, ColumnsElem, GridCell, GridElem,
-    HAlignment, HElem, Length, OuterVAlignment, PagebreakElem, Rel, Sides, Sizing,
+    AlignElem, Alignment, BlockElem, Celled, ColbreakElem, ColumnsElem, GridCell,
+    GridElem, HAlignment, HElem, Length, OuterVAlignment, PagebreakElem, PlaceElem, Rel,
+    Sides, Sizing, Spacing, VElem,
 };
 use typst_library::math::EquationElem;
 use typst_library::math::ir::resolve_equation;
@@ -72,6 +74,8 @@ pub fn register(rules: &mut NativeRuleMap) {
     rules.register(Html, GRID_RULE);
     rules.register(Html, COLUMNS_RULE);
     rules.register(Html, COLBREAK_RULE);
+    rules.register(Html, PLACE_RULE);
+    rules.register(Html, VSPACE_RULE);
     rules.register(Html, LINE_RULE);
     rules.register(Html, PAGEBREAK_RULE);
     rules.register(Html, ALIGN_RULE);
@@ -233,7 +237,8 @@ const LINE_RULE: ShowFn<LineElem> = |elem, _, styles| {
         Paint::Solid(color) => color.to_hex().trim_start_matches('#').to_string(),
         _ => "000000".to_string(),
     };
-    let style = eco_format!("border-top-width: {thickness}pt; border-top-color: #{color}");
+    let style =
+        eco_format!("border-top-width: {thickness}pt; border-top-color: #{color}");
     Ok(BlockElem::packed(
         HtmlElem::new(tag::hr)
             .with_attr(attr::style, style)
@@ -260,7 +265,8 @@ const COLUMNS_RULE: ShowFn<ColumnsElem> = |elem, _, styles| {
     let style = eco_format!(
         "column-count: {}; column-gap: calc({}pt + {}%)",
         elem.count.get(styles).get(),
-        gutter.abs.abs.to_pt() + gutter.abs.em.get() * styles.resolve(TextElem::size).to_pt(),
+        gutter.abs.abs.to_pt()
+            + gutter.abs.em.get() * styles.resolve(TextElem::size).to_pt(),
         gutter.rel.get() * 100.0,
     );
     Ok(BlockElem::packed(
@@ -281,6 +287,56 @@ const COLBREAK_RULE: ShowFn<ColbreakElem> = |elem, _, _| {
             .pack()
             .spanned(elem.span()),
     ))
+};
+
+const PLACE_RULE: ShowFn<PlaceElem> = |elem, engine, styles| {
+    if !elem.float.get(styles) {
+        engine.sink.warn(warning!(
+            elem.span(),
+            "overlaid content was retained but its placement was not exported"
+        ));
+        return Ok(elem.body.clone());
+    }
+
+    // Layout the complete composition (including rotation and framing) as an
+    // export-time frame; the DOCX exporter anchors its SVG at the paged position.
+    let frame = FrameElem::new(elem.body.clone()).pack().spanned(elem.span());
+    Ok(BlockElem::packed(
+        HtmlElem::new(tag::div)
+            .with_attr(attr::class, "typst-float")
+            .with_body(Some(frame))
+            .pack()
+            .spanned(elem.span()),
+    ))
+};
+
+const VSPACE_RULE: ShowFn<VElem> = |elem, engine, styles| {
+    let height_pt = match elem.amount {
+        Spacing::Rel(rel) => {
+            if !rel.rel.is_zero() {
+                engine.sink.warn(warning!(
+                    elem.span(),
+                    "relative vertical spacing was approximated using its fixed length"
+                ));
+            }
+            rel.abs.at(styles.resolve(TextElem::size)).to_pt()
+        }
+        // Fractional and percentage vertical spacing depends on the enclosing
+        // page/region's remaining height; fixed spacing is the portable case.
+        Spacing::Fr(_) => {
+            engine.sink.warn(warning!(
+                elem.span(),
+                "fractional vertical spacing is not supported by DOCX export"
+            ));
+            0.0
+        }
+    };
+    let node = HtmlElem::new(tag::div)
+        .with_attr(attr::class, "typst-vspace")
+        .with_attr(attr::style, eco_format!("height: {height_pt}pt"))
+        .pack()
+        .spanned(elem.span());
+    Ok(BlockElem::packed(node))
 };
 
 /// `#align` is not yet a first-class HTML concept, but its content must not be
@@ -367,7 +423,10 @@ const FIGURE_RULE: ShowFn<FigureElem> = |elem, _, styles| {
 
     Ok(BlockElem::packed(
         HtmlElem::new(tag::figure)
-            .with_attr(attr::style, eco_format!("text-align: center; figure-gap: {gap_pt}pt"))
+            .with_attr(
+                attr::style,
+                eco_format!("text-align: center; figure-gap: {gap_pt}pt"),
+            )
             .with_body(Some(realized))
             .pack()
             .spanned(elem.span()),
@@ -670,7 +729,14 @@ const CSL_INDENT_RULE: ShowFn<CslIndentElem> = |elem, _, _| {
 
 const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span(), false, &elem.align.get_cloned(styles), &elem.inset.get_cloned(styles)))
+    Ok(show_cellgrid(
+        grid,
+        styles,
+        elem.span(),
+        false,
+        &elem.align.get_cloned(styles),
+        &elem.inset.get_cloned(styles),
+    ))
 };
 
 /// A `grid` has the same resolved cell structure as a `table`, so it exports as
@@ -678,14 +744,18 @@ const TABLE_RULE: ShowFn<TableElem> = |elem, _, styles| {
 /// downstream consumer knows it has no borders (unlike a `table`).
 const GRID_RULE: ShowFn<GridElem> = |elem, _, styles| {
     let grid = elem.grid.as_ref().unwrap();
-    Ok(show_cellgrid(grid, styles, elem.span(), true, &elem.align.get_cloned(styles), &elem.inset.get_cloned(styles)))
+    Ok(show_cellgrid(
+        grid,
+        styles,
+        elem.span(),
+        true,
+        &elem.align.get_cloned(styles),
+        &elem.inset.get_cloned(styles),
+    ))
 };
 
 /// A cell column's inset as a CSS `padding` value (`T R B L`).
-fn column_padding(
-    inset: &Celled<Sides<Option<Rel<Length>>>>,
-    column: usize,
-) -> String {
+fn column_padding(inset: &Celled<Sides<Option<Rel<Length>>>>, column: usize) -> String {
     let value = match inset {
         Celled::Value(value) => value.clone(),
         Celled::Array(array) if !array.is_empty() => array[column % array.len()].clone(),
@@ -838,11 +908,8 @@ fn show_cellgrid(
     } else {
         grid.cols.iter().copied().map(sizing_css).collect()
     };
-    let gutter = if grid.has_gutter {
-        grid.cols.get(1).copied().map(sizing_css)
-    } else {
-        None
-    };
+    let gutter =
+        if grid.has_gutter { grid.cols.get(1).copied().map(sizing_css) } else { None };
 
     let mut attrs = HtmlAttrs::new();
     attrs.push(attr::class, if borderless { "grid" } else { "table" });

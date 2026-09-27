@@ -11,9 +11,10 @@ use std::io::{Cursor, Write};
 
 use ecow::eco_format;
 use typst_html::{HtmlDocument, HtmlElement, HtmlFrame, HtmlNode, HtmlTag, attr, tag};
+use typst_layout::PagedDocument;
 use typst_library::diag::StrResult;
 use typst_library::layout::Abs;
-use typst_layout::PagedDocument;
+use typst_syntax::Span;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -48,7 +49,8 @@ pub fn docx(
         .collect();
 
     let rules = layout.map(layout::collect_rules).unwrap_or_default();
-    let all_images = layout.map(layout::collect_images).unwrap_or_default();    let body_images: Vec<layout::ImageInfo> = all_images
+    let all_images = layout.map(layout::collect_images).unwrap_or_default();
+    let body_images: Vec<layout::ImageInfo> = all_images
         .iter()
         .filter(|image| image.region == layout::PageRegion::Body)
         .cloned()
@@ -72,6 +74,14 @@ pub fn docx(
         })
         .unwrap_or((0.0, 450.0));
     let content_width_pt = content_right - content_left;
+    let (header_dist, footer_dist) = header_footer_distances(&all, layout);
+    let section_template = sect_pr(
+        layout,
+        find_element(document.root(), tag::header).is_some(),
+        find_element(document.root(), tag::footer).is_some(),
+        header_dist,
+        footer_dist,
+    );
 
     let mut em = Emitter::new(
         &body_runs,
@@ -83,6 +93,7 @@ pub fn docx(
         0,
         0,
     );
+    em.section_template = Some(section_template);
     if let Some(body) = find_body(document.root()) {
         for child in &body.children {
             em.block(child);
@@ -118,7 +129,22 @@ pub fn docx(
         0,
         footer_rule_after,
     );
-    let (header_dist, footer_dist) = header_footer_distances(&all, layout);
+    let mut final_section =
+        sect_pr(layout, header.is_some(), footer.is_some(), header_dist, footer_dist);
+    if let Some((count, gap)) = em.terminal_columns {
+        let end_marker = em.section_marker(count, gap);
+        if em.out.ends_with(&end_marker) {
+            em.out.truncate(em.out.len() - end_marker.len());
+        }
+        final_section = final_section.replace(
+            "<w:pgSz",
+            "<w:type w:val=\"continuous\"/><w:pgSz",
+        );
+        let columns = format!(
+            "<w:cols w:num=\"{count}\" w:space=\"{gap}\" w:equalWidth=\"1\"/>"
+        );
+        final_section = final_section.replace("</w:sectPr>", &format!("{columns}</w:sectPr>"));
+    }
 
     let document_xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -127,7 +153,7 @@ pub fn docx(
          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
          <w:body>{}{}</w:body></w:document>",
         em.out,
-        sect_pr(layout, header.is_some(), footer.is_some(), header_dist, footer_dist)
+        final_section
     );
 
     package(
@@ -211,7 +237,8 @@ fn collect_endnote_items(el: &HtmlElement, footnotes: &mut Vec<Footnote>) {
             let mut runs = Vec::new();
             for grand in &child.children {
                 if let HtmlNode::Element(g) = grand {
-                    if g.attrs.get(attr::role).map(|r| r.as_str()) == Some("doc-backlink") {
+                    if g.attrs.get(attr::role).map(|r| r.as_str()) == Some("doc-backlink")
+                    {
                         continue;
                     }
                 }
@@ -278,9 +305,7 @@ fn region_rule_gaps(
     rules: &[layout::Rule],
     region: layout::PageRegion,
 ) -> (i64, i64) {
-    let Some(rule) = rules
-        .iter()
-        .find(|rule| rule.region == region && rule.page == 1)
+    let Some(rule) = rules.iter().find(|rule| rule.region == region && rule.page == 1)
     else {
         return (0, 0);
     };
@@ -322,6 +347,35 @@ fn find_element<'a>(el: &'a HtmlElement, tag_name: HtmlTag) -> Option<&'a HtmlEl
         }
     }
     None
+}
+
+fn find_frame(el: &HtmlElement) -> Option<&HtmlFrame> {
+    for child in &el.children {
+        match child {
+            HtmlNode::Frame(frame) => return Some(frame),
+            HtmlNode::Element(child) => {
+                if let Some(frame) = find_frame(child) {
+                    return Some(frame);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A grid cell can contain an `align(...)` wrapper, whose alignment belongs to
+/// the cell paragraph even though the `<td>` itself has no `text-align` style.
+fn nested_text_align(el: &HtmlElement) -> Option<String> {
+    el.attrs
+        .get(attr::style)
+        .and_then(|style| parse_text_align(style))
+        .or_else(|| {
+            el.children.iter().find_map(|child| match child {
+                HtmlNode::Element(child) => nested_text_align(child),
+                _ => None,
+            })
+        })
 }
 
 fn find_body(el: &HtmlElement) -> Option<&HtmlElement> {
@@ -426,18 +480,28 @@ struct Emitter<'a> {
     /// The numbered run in the caption currently being emitted, if any.
     caption_seq: Option<(usize, String)>,
     caption_counters: HashMap<String, u64>,
+    /// Last numeric equation value emitted through a Word `SEQ` field.
+    equation_counter: u64,
     /// Next numbering id handed out to a new ordered list.
     next_num_id: u32,
     /// Ordered-list numbering ids that were handed out.
     ordered_num_ids: Vec<u32>,
     /// Direct left indent (twips) for the next paragraph, if any.
     indent: Option<i64>,
+    /// Hanging indent and tab stop for a term/definition paragraph.
+    definition_indent: Option<i64>,
+    /// Measured description start for the term on the current definition item.
+    definition_tab_pos: Option<i64>,
+    /// Insert a tab before this run while emitting a definition paragraph.
+    definition_tab_at: Option<usize>,
     /// Body horizontal rules, in document order.
     body_rules: Vec<layout::Rule>,
     /// Next unconsumed body rule.
     rule_cursor: usize,
     /// The y of the most recently matched block, for interleaving rules.
     last_y: f64,
+    /// A Typst column break to attach to the next paragraph's first run.
+    pending_column_break: bool,
     /// The available content width in points, for resolving grid tracks.
     content_width_pt: f64,
     /// Whether this emitter is building a footer (so a digits-only run becomes
@@ -455,8 +519,8 @@ struct Emitter<'a> {
     current_typo: Option<Typography>,
     /// Placed images, for sizing an `<img>` (in document order).
     layout_images: Vec<layout::ImageInfo>,
-    /// Next unconsumed layout image.
-    image_cursor: usize,
+    /// Layout images already matched to source image expressions.
+    used_layout_images: Vec<bool>,
     next_drawing_id: u32,
     /// Embedded image parts collected while emitting.
     images: Vec<Media>,
@@ -468,6 +532,10 @@ struct Emitter<'a> {
     toc: bool,
     /// The page number for the next TOC entry.
     toc_page: Option<u64>,
+    /// Full page/region properties reused by bounded section breaks.
+    section_template: Option<String>,
+    /// Column settings when the final body block is a columns region.
+    terminal_columns: Option<(usize, i64)>,
 }
 
 impl Emitter<'_> {
@@ -495,26 +563,33 @@ impl Emitter<'_> {
             column_start: false,
             caption_seq: None,
             caption_counters: HashMap::new(),
+            equation_counter: 0,
             next_num_id: 100,
             ordered_num_ids: Vec::new(),
             indent: None,
+            definition_indent: None,
+            definition_tab_pos: None,
+            definition_tab_at: None,
             body_rules: Vec::new(),
             rule_cursor: 0,
             last_y: 0.0,
+            pending_column_break: false,
             content_width_pt,
             is_footer,
             is_region,
             rule_before,
             rule_after,
             current_typo: None,
+            used_layout_images: vec![false; layout_images.len()],
             layout_images,
-            image_cursor: 0,
             next_drawing_id: 1,
             images: Vec::new(),
             hyperlinks: Vec::new(),
             footnotes,
             toc: false,
             toc_page: None,
+            section_template: None,
+            terminal_columns: None,
         }
     }
 
@@ -528,6 +603,20 @@ impl Emitter<'_> {
     }
 
     fn block(&mut self, node: &HtmlNode) {
+        let meaningful = match node {
+            HtmlNode::Text(text, _) => !text.trim().is_empty(),
+            HtmlNode::Element(element) => {
+                element.attrs.get(attr::role).map(|role| role.as_str())
+                    != Some("doc-endnotes")
+                    && element.tag != tag::header
+                    && element.tag != tag::footer
+            }
+            HtmlNode::Frame(_) => true,
+            _ => false,
+        };
+        if meaningful && !self.in_columns {
+            self.terminal_columns = None;
+        }
         match node {
             HtmlNode::Element(el) => self.block_el(el),
             HtmlNode::Frame(frame) => self.svg_frame(frame),
@@ -580,12 +669,17 @@ impl Emitter<'_> {
             self.paragraph("Heading4", &runs, None);
         } else if t == tag::p {
             let previous = self.align.clone();
-            if let Some(align) = el.attrs.get(attr::style).and_then(|s| parse_text_align(s)) {
+            if let Some(align) =
+                el.attrs.get(attr::style).and_then(|s| parse_text_align(s))
+            {
                 self.align = Some(align);
             }
             if let [HtmlNode::Element(box_el)] = el.children.as_slice()
                 && box_el.tag == tag::span
-                && box_el.attrs.get(attr::style).is_some_and(|style| style.contains("background-color:"))
+                && box_el
+                    .attrs
+                    .get(attr::style)
+                    .is_some_and(|style| style.contains("background-color:"))
             {
                 self.filled_box(box_el);
             } else {
@@ -609,15 +703,25 @@ impl Emitter<'_> {
             self.display_equation(el);
         } else if t == tag::figcaption || t == tag::caption {
             let runs = inline(&el.children, false, false, false, None);
-            if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-numbered-caption") {
+            if el.attrs.get(attr::class).map(|c| c.as_str())
+                == Some("typst-numbered-caption")
+            {
                 if let Some((index, label, number)) = caption_number(&runs) {
-                    let previous = self.caption_counters.insert(label.clone(), number).unwrap_or(0);
-                    let reset = if number != previous + 1 { format!(" \\r {number}") } else { String::new() };
-                    self.caption_seq = Some((index, format!(" SEQ {label}{reset} \\* ARABIC ")));
+                    let previous =
+                        self.caption_counters.insert(label.clone(), number).unwrap_or(0);
+                    let reset = if number != previous + 1 {
+                        format!(" \\r {number}")
+                    } else {
+                        String::new()
+                    };
+                    self.caption_seq =
+                        Some((index, format!(" SEQ {label}{reset} \\* ARABIC ")));
                 }
             }
             self.paragraph("Caption", &runs, None);
             self.caption_seq = None;
+        } else if el.attrs.get(attr::role).map(|role| role.as_str()) == Some("doc-toc") {
+            self.native_toc(el);
         } else if t == tag::ul {
             if list_style_none(el) {
                 self.plain_list(el, 0);
@@ -633,13 +737,36 @@ impl Emitter<'_> {
             }
         } else if t == tag::table {
             self.table(el);
+        } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-float") {
+            self.floating_frame(el);
+        } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-vspace") {
+            let height = el
+                .attrs
+                .get(attr::style)
+                .and_then(|style| parse_pt_property(style, "height:"))
+                .unwrap_or(0);
+            if height != 0 {
+                self.out.push_str(&format!(
+                    "<w:p><w:pPr><w:spacing w:before=\"{height}\" w:after=\"0\" \
+                     w:line=\"1\" w:lineRule=\"exact\"/></w:pPr><w:r><w:t> </w:t></w:r></w:p>"
+                ));
+            }
         } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-columns") {
             self.columns(el);
-        } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-colbreak") {
-            let kind = if self.in_columns { "column" } else { "page" };
-            self.out.push_str(&format!("<w:p><w:r><w:br w:type=\"{kind}\"/></w:r></w:p>"));
+        } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-colbreak")
+        {
+            if !self.in_columns {
+                self.out
+                    .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
+            } else {
+                self.pending_column_break = true;
+                self.column_start = true;
+            }
         } else if t == tag::span
-            && el.attrs.get(attr::style).is_some_and(|style| style.contains("background-color:"))
+            && el
+                .attrs
+                .get(attr::style)
+                .is_some_and(|style| style.contains("background-color:"))
         {
             self.filled_box(el);
         } else if t == tag::dl {
@@ -658,22 +785,26 @@ impl Emitter<'_> {
                 self.rule_after,
             ));
         } else if el.attrs.get(attr::class).map(|c| c.as_str()) == Some("pagebreak") {
-            self.out
-                .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
+            self.out.push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
         } else {
             // div/section/figure/body/... : honor a `text-align`, then either
             // recurse (block children) or emit inline content as one paragraph.
             let previous = self.align.clone();
             let previous_gap = self.figure_gap;
             if t == tag::figure {
-                self.figure_gap = el.attrs.get(attr::style).and_then(|s| parse_pt_property(s, "figure-gap:"));
+                self.figure_gap = el
+                    .attrs
+                    .get(attr::style)
+                    .and_then(|s| parse_pt_property(s, "figure-gap:"));
                 if find_element(el, tag::img).is_some() {
                     // Word's inline drawing line box adds ~5pt below the
                     // image. Avoid counting it again as caption spacing.
                     self.figure_gap = self.figure_gap.map(|gap| (gap - 100).max(0));
                 }
             }
-            if let Some(align) = el.attrs.get(attr::style).and_then(|s| parse_text_align(s)) {
+            if let Some(align) =
+                el.attrs.get(attr::style).and_then(|s| parse_text_align(s))
+            {
                 self.align = Some(align);
             }
             if has_block_child(el) {
@@ -692,7 +823,10 @@ impl Emitter<'_> {
     }
 
     fn paragraph(&mut self, style: &str, runs: &[Run], num: Option<(u32, u32)>) {
-        let typos = self.measure_runs(runs);
+        let typos = self.measure_runs(
+            runs,
+            matches!(style, "Title" | "Heading1" | "Heading2" | "Heading3" | "Heading4"),
+        );
         self.current_typo = typos.iter().flatten().next().cloned();
         self.flush_rules();
         self.record_sample(style, &typos);
@@ -702,13 +836,14 @@ impl Emitter<'_> {
             in_columns: self.in_columns,
         });
         self.out.push_str("<w:p><w:pPr>");
-        self.out
-            .push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
+        self.out.push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
         if self.in_columns && self.column_start {
             self.out.push_str("<w:spacing w:before=\"0\"/>");
             self.column_start = false;
         } else if style == "Heading2"
-            && self.blocks.get(self.blocks.len().saturating_sub(2))
+            && self
+                .blocks
+                .get(self.blocks.len().saturating_sub(2))
                 .is_some_and(|previous| previous.style == "Heading1")
         {
             // Consecutive levels keep the larger Typst block gap; a heading
@@ -716,12 +851,15 @@ impl Emitter<'_> {
             self.out.push_str("<w:spacing w:before=\"300\"/>");
         }
         if self.in_cell {
-            let line = (typos.iter().flatten().map(|t| t.size_pt).fold(10.5_f64, f64::max)
-                * 20.0).round() as i64;
+            let line =
+                (typos.iter().flatten().map(|t| t.size_pt).fold(10.5_f64, f64::max)
+                    * 20.0)
+                    .round() as i64;
             self.out.push_str(&format!("<w:spacing w:before=\"0\" w:after=\"0\" w:line=\"{line}\" w:lineRule=\"exact\"/>"));
         } else if style == "Caption" {
             let gap = self.figure_gap.unwrap_or(0);
-            self.out.push_str(&format!("<w:spacing w:before=\"{gap}\" w:after=\"0\"/>"));
+            self.out
+                .push_str(&format!("<w:spacing w:before=\"{gap}\" w:after=\"0\"/>"));
         }
         if self.is_region {
             // Header/footer paragraphs must not inherit the body's Normal
@@ -744,6 +882,16 @@ impl Emitter<'_> {
         } else if let Some(indent) = self.indent {
             self.out.push_str(&format!("<w:ind w:left=\"{indent}\"/>"));
         }
+        if let Some(indent) = self.definition_indent {
+            self.out.push_str(&format!(
+                "<w:ind w:left=\"{indent}\" w:hanging=\"{indent}\"/>"
+            ));
+        }
+        if let Some(tab_pos) = self.definition_tab_pos {
+            self.out.push_str(&format!(
+                "<w:tabs><w:tab w:val=\"left\" w:pos=\"{tab_pos}\"/></w:tabs>"
+            ));
+        }
         if let Some(align) = self.align.clone() {
             self.out.push_str(&format!("<w:jc w:val=\"{align}\"/>"));
         }
@@ -754,12 +902,23 @@ impl Emitter<'_> {
             ));
         }
         self.out.push_str("</w:pPr>");
-        let compensate_width = style == "Normal" && runs.iter().any(|run| run.math_xml.is_some());
+        if self.pending_column_break {
+            self.out.push_str("<w:r><w:br w:type=\"column\"/></w:r>");
+            self.pending_column_break = false;
+        }
+        let compensate_width =
+            style == "Normal" && runs.iter().any(|run| run.math_xml.is_some());
         for (index, (run, typo)) in runs.iter().zip(typos.iter()).enumerate() {
+            if self.definition_tab_at == Some(index) {
+                self.out.push_str("<w:r><w:tab/></w:r>");
+            }
             if let Some((number_index, instruction)) = &self.caption_seq
                 && index == *number_index
             {
-                self.out.push_str(&format!("<w:fldSimple w:instr=\"{}\">", escape_xml(instruction)));
+                self.out.push_str(&format!(
+                    "<w:fldSimple w:instr=\"{}\">",
+                    escape_xml(instruction)
+                ));
                 self.run(run, typo.as_ref(), compensate_width);
                 self.out.push_str("</w:fldSimple>");
                 continue;
@@ -799,7 +958,7 @@ impl Emitter<'_> {
 
     /// Measure the resolved typography of each run by matching it to a layout
     /// run. Returns a direct override for every matched run.
-    fn measure_runs(&mut self, runs: &[Run]) -> Vec<Option<Typography>> {
+    fn measure_runs(&mut self, runs: &[Run], heading: bool) -> Vec<Option<Typography>> {
         let mut overrides = vec![None; runs.len()];
         let mut cursor = self.cursor;
         let mut first_y: Option<f64> = None;
@@ -813,7 +972,13 @@ impl Emitter<'_> {
                 // Values such as `+9%` normalize to one character. Match the
                 // original text exactly when it occurs only once in the paged
                 // layout, so its explicit color is not lost.
-                let mut matches = self.runs.iter().filter(|candidate| candidate.text.trim() == run.text.trim());
+                let mut matches = self
+                    .runs
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.text.trim() == run.text.trim()
+                            && (run.mono || !is_monospace_family(&candidate.family))
+                    });
                 if let Some(candidate) = matches.next()
                     && matches.next().is_none()
                 {
@@ -831,14 +996,20 @@ impl Emitter<'_> {
             let found = if cursor < self.runs.len() {
                 self.runs[cursor..].iter().position(|layout_run| {
                     let text = collapse(&layout_run.text);
-                    !text.is_empty() && (text.starts_with(&target) || target.starts_with(&text))
+                    text.len() >= 3
+                        && (run.mono || !is_monospace_family(&layout_run.family))
+                        && (text.starts_with(&target) || target.starts_with(&text))
+                        // A heading can share its text with a card or TOC
+                        // entry. Prefer its larger resolved layout run.
+                        && (!heading || layout_run.size_pt > 10.5)
                 })
             } else {
                 None
             };
 
             if let Some(offset) = found {
-                let layout_run = &self.runs[cursor + offset];
+                let layout_index = cursor + offset;
+                let layout_run = &self.runs[layout_index];
                 cursor += offset + 1;
                 if first_y.is_none() {
                     first_y = Some(layout_run.y_pt);
@@ -854,10 +1025,32 @@ impl Emitter<'_> {
                 // An HTML element (notably a figure/table) can advance the
                 // layout cursor past a cell run. Recover unique text from the
                 // paged layout so explicit colors still survive HTML export.
-                let mut matches = self.runs.iter().filter(|candidate| collapse(&candidate.text) == target);
-                if let Some(candidate) = matches.next()
-                    && matches.next().is_none()
-                {
+                let candidate = if heading {
+                    self.runs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| {
+                            let text = collapse(&candidate.text);
+                            candidate.size_pt > 10.5
+                                && (run.mono || !is_monospace_family(&candidate.family))
+                                && (text == target
+                                    || text.starts_with(&target)
+                                    || target.starts_with(&text))
+                        })
+                        .max_by(|(_, left), (_, right)| left.size_pt.total_cmp(&right.size_pt))
+                } else {
+                    let mut matches = self
+                        .runs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| {
+                            collapse(&candidate.text) == target
+                                && (run.mono || !is_monospace_family(&candidate.family))
+                        });
+                    let first = matches.next();
+                    if matches.next().is_none() { first } else { None }
+                };
+                if let Some((layout_index, candidate)) = candidate {
                     overrides[index] = Some(Typography {
                         family: candidate.family.clone(),
                         size_pt: candidate.size_pt,
@@ -865,6 +1058,12 @@ impl Emitter<'_> {
                         italic: candidate.italic,
                         color: candidate.color.clone(),
                     });
+                    if first_y.is_none() {
+                        first_y = Some(candidate.y_pt);
+                    }
+                    // Re-anchor subsequent text matching after an element
+                    // moved the semantic and layout cursors apart.
+                    cursor = layout_index + 1;
                 }
             }
         }
@@ -891,6 +1090,9 @@ impl Emitter<'_> {
 
     /// Emit any body rules left after the last block.
     fn flush_all_rules(&mut self) {
+        if self.rule_cursor < self.body_rules.len() {
+            self.terminal_columns = None;
+        }
         while self.rule_cursor < self.body_rules.len() {
             let rule = self.body_rules[self.rule_cursor].clone();
             self.out
@@ -900,6 +1102,12 @@ impl Emitter<'_> {
     }
 
     fn run(&mut self, run: &Run, typo: Option<&Typography>, compensate_width: bool) {
+        let region_typo = self.is_region.then(|| self.current_typo.clone()).flatten();
+        let typo = if self.is_region {
+            typo.or(region_typo.as_ref())
+        } else {
+            typo
+        };
         if let Some(math) = &run.math_xml {
             self.out.push_str(math);
             return;
@@ -955,11 +1163,7 @@ impl Emitter<'_> {
             None => None,
         };
         self.out.push_str("<w:r>");
-        let spacing = if compensate_width {
-            "<w:spacing w:val=\"-3\"/>"
-        } else {
-            ""
-        };
+        let spacing = if compensate_width { "<w:spacing w:val=\"-3\"/>" } else { "" };
         if let Some(typo) = typo {
             let size = (typo.size_pt * 2.0).round().max(2.0) as i64;
             self.out.push_str("<w:rPr>");
@@ -967,10 +1171,10 @@ impl Emitter<'_> {
                 "<w:rFonts w:ascii=\"{0}\" w:hAnsi=\"{0}\" w:cs=\"{0}\"/>",
                 escape_xml(&typo.family)
             ));
-            if typo.bold {
+            if typo.bold || run.bold {
                 self.out.push_str("<w:b/>");
             }
-            if typo.italic {
+            if typo.italic || run.italic {
                 self.out.push_str("<w:i/>");
             }
             self.out.push_str(&format!(
@@ -984,7 +1188,13 @@ impl Emitter<'_> {
                 self.out.push_str("<w:highlight w:val=\"yellow\"/>");
             }
             self.out.push_str("</w:rPr>");
-        } else if run.bold || run.italic || run.mono || run.strike || run.highlight || compensate_width {
+        } else if run.bold
+            || run.italic
+            || run.mono
+            || run.strike
+            || run.highlight
+            || compensate_width
+        {
             self.out.push_str("<w:rPr>");
             if run.mono {
                 self.out.push_str(
@@ -1023,28 +1233,75 @@ impl Emitter<'_> {
     /// Emit a definition list (Typst's term list) as a bold term followed by
     /// its description on one line.
     fn definition_list(&mut self, el: &HtmlElement) {
-        let mut term: Vec<Run> = Vec::new();
+        let mut entries = Vec::new();
+        let mut term_element: Option<&HtmlElement> = None;
         for child in &el.children {
             let HtmlNode::Element(child) = child else { continue };
             if child.tag == tag::dt {
-                term = inline(&child.children, true, false, false, None);
+                term_element = Some(child);
             } else if child.tag == tag::dd {
-                let mut runs = std::mem::take(&mut term);
-                runs.push(Run {
-                    text: "  ".to_string(),
-                    math_xml: None,
-                    bold: false,
-                    italic: false,
-                    mono: false,
-                    br: false,
-                    href: None,
-                    footnote_ref: None,
-                    strike: false,
-                    highlight: false,
-                });
-                runs.extend(inline(&child.children, false, false, false, None));
-                self.paragraph("Normal", &runs, None);
+                if let Some(term) = term_element.take() {
+                    let mut term_runs = inline(&term.children, true, false, false, None);
+                    if !term_runs.is_empty()
+                        && !term_runs.last().is_some_and(|run| run.text.ends_with(':'))
+                    {
+                        term_runs.push(Run {
+                            text: ":".to_string(),
+                            math_xml: None,
+                            bold: true,
+                            italic: false,
+                            mono: false,
+                            br: false,
+                            href: None,
+                            footnote_ref: None,
+                            strike: false,
+                            highlight: false,
+                        });
+                    }
+                    let description = inline(&child.children, false, false, false, None);
+                    let term_text = text_of(term);
+                    let description_text = text_of(child);
+                    let measured_indent = self
+                        .measure_position(&term_text)
+                        .zip(self.measure_position(&description_text))
+                        .filter(|((_, term_y), (_, description_y))| {
+                            (term_y - description_y).abs() < 1.0
+                        })
+                        .map(|((term_x, _), (description_x, _))| description_x - term_x)
+                        .filter(|indent| *indent > 0.0);
+                    let term_width = measured_indent.unwrap_or_else(|| {
+                        self.measure_width(&term_text)
+                            .unwrap_or(term_text.chars().count() as f64 * 5.25)
+                            + 5.0
+                    });
+                    entries.push((term_runs, description, term_width));
+                }
             }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        for (mut term, description, term_width) in entries {
+            let term_text: String = term.iter().map(|run| run.text.as_str()).collect();
+            let font_size = self
+                .runs
+                .iter()
+                .find(|run| collapse(&run.text) == collapse(&term_text))
+                .map(|run| run.size_pt)
+                .unwrap_or(10.0);
+            // Typst's default terms.hanging-indent is 2em; the tab itself is
+            // positioned from the measured term/description geometry.
+            let hanging = (font_size * 2.0 * 20.0).round() as i64;
+            let tab_pos = ((term_width + 3.0).min(self.content_width_pt * 0.4) * 20.0)
+                .round() as i64;
+            self.definition_tab_at = Some(term.len());
+            term.extend(description);
+            self.definition_indent = Some(hanging);
+            self.definition_tab_pos = Some(tab_pos);
+            self.paragraph("Normal", &term, None);
+            self.definition_indent = None;
+            self.definition_tab_pos = None;
+            self.definition_tab_at = None;
         }
     }
 
@@ -1060,9 +1317,7 @@ impl Emitter<'_> {
             let mut runs = Vec::new();
             for grand in &li.children {
                 match grand {
-                    HtmlNode::Element(g)
-                        if g.tag == tag::ul || g.tag == tag::ol =>
-                    {
+                    HtmlNode::Element(g) if g.tag == tag::ul || g.tag == tag::ol => {
                         // handled below
                     }
                     _ => collect_inline(grand, false, false, false, None, &mut runs),
@@ -1148,6 +1403,48 @@ impl Emitter<'_> {
         }
     }
 
+    /// Emit Word's native, updateable Table of Contents content control. The
+    /// document settings request field updates when the file is opened.
+    fn native_toc(&mut self, el: &HtmlElement) {
+        let list = el.children.iter().find_map(|node| match node {
+            HtmlNode::Element(list) if list.tag == tag::ol || list.tag == tag::ul => Some(list),
+            _ => None,
+        });
+        for child in &el.children {
+            if let HtmlNode::Element(child) = child
+                && child.tag != tag::ol
+                && child.tag != tag::ul
+            {
+                if matches!(child.tag, tag::h1 | tag::h2) {
+                    let runs = inline(&child.children, false, false, false, None);
+                    self.paragraph("TOCHeading", &runs, None);
+                } else {
+                    self.block_el(child);
+                }
+            }
+        }
+        self.out.push_str(
+            "<w:sdt><w:sdtPr><w:alias w:val=\"Table of Contents\"/>\
+             <w:docPartObj><w:docPartGallery w:val=\"Table of Contents\"/>\
+             <w:docPartUnique/></w:docPartObj></w:sdtPr><w:sdtContent>\
+             <w:p><w:pPr><w:pStyle w:val=\"TOCHeading\"/></w:pPr>\
+             <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText xml:space=\"preserve\"> TOC \\o &quot;1-2&quot; \\h \\z \\u </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r></w:p>",
+        );
+        if let Some(list) = list {
+            let body_cursor = self.cursor;
+            self.plain_list(list, 0);
+            // Cached TOC entries reuse heading text, but must not consume the
+            // layout runs that later determine heading typography and page breaks.
+            self.cursor = body_cursor;
+        }
+        self.out.push_str(
+            "<w:p><w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:p>\
+             </w:sdtContent></w:sdt>",
+        );
+    }
+
     /// Allocate a fresh numbering id for a new ordered list so its counter
     /// restarts at 1.
     fn alloc_num_id(&mut self) -> u32 {
@@ -1169,6 +1466,26 @@ impl Emitter<'_> {
             .map(|run| run.width_pt)
     }
 
+    /// Find a phrase's compiler-measured origin. Prefer the longest matching
+    /// run so common short words don't capture an unrelated position.
+    fn measure_position(&self, text: &str) -> Option<(f64, f64)> {
+        let target = collapse(text);
+        if target.is_empty() {
+            return None;
+        }
+        self.runs
+            .iter()
+            .filter(|run| {
+                let candidate = collapse(&run.text);
+                !candidate.is_empty()
+                    && (candidate == target
+                        || candidate.starts_with(&target)
+                        || target.starts_with(&candidate))
+            })
+            .max_by_key(|run| collapse(&run.text).len().min(target.len()))
+            .map(|run| (run.x_pt, run.y_pt))
+    }
+
     /// Emit an `<img>` as an inline drawing, embedding the image data.
     fn image(&mut self, el: &HtmlElement) {
         let Some(src) = el.attrs.get(attr::src) else { return };
@@ -1178,12 +1495,46 @@ impl Emitter<'_> {
         };
 
         let (width, height) = self
-            .layout_images
-            .get(self.image_cursor)
+            .take_layout_image(el.span)
+            .as_ref()
             .map(|image| (image.width_pt, image.height_pt))
             .unwrap_or((100.0, 100.0));
-        self.image_cursor += 1;
-        self.embed_image(mime, bytes, width, height);
+        self.embed_image(mime, bytes, width, height, None);
+    }
+
+    fn take_layout_image(&mut self, span: Span) -> Option<layout::ImageInfo> {
+        let index = if span != Span::detached() {
+            self.layout_images.iter().enumerate().position(|(index, image)| {
+                !self.used_layout_images[index] && image.span == span
+            })
+        } else {
+            self.used_layout_images.iter().position(|used| !*used)
+        }?;
+        self.used_layout_images[index] = true;
+        Some(self.layout_images[index].clone())
+    }
+
+    fn floating_frame(&mut self, el: &HtmlElement) {
+        let Some(frame) = find_frame(el) else { return };
+        let size = frame.inner.size();
+        if size.x.to_pt() <= 0.0 || size.y.to_pt() <= 0.0 {
+            return;
+        }
+        let source = layout::first_image_span(&frame.inner).unwrap_or(frame.span);
+        let positioned = self.take_layout_image(source).map(|image| {
+            (
+                image.x_pt - (size.x.to_pt() - image.width_pt) / 2.0,
+                image.y_pt - (size.y.to_pt() - image.height_pt) / 2.0,
+            )
+        });
+        let svg = typst_svg::svg_frame(&frame.inner);
+        self.embed_image(
+            "image/svg+xml",
+            svg.into_bytes(),
+            size.x.to_pt(),
+            size.y.to_pt(),
+            positioned,
+        );
     }
 
     fn svg_frame(&mut self, frame: &HtmlFrame) {
@@ -1192,10 +1543,23 @@ impl Emitter<'_> {
             return;
         }
         let svg = typst_svg::svg_frame(&frame.inner);
-        self.embed_image("image/svg+xml", svg.into_bytes(), size.x.to_pt(), size.y.to_pt());
+        self.embed_image(
+            "image/svg+xml",
+            svg.into_bytes(),
+            size.x.to_pt(),
+            size.y.to_pt(),
+            None,
+        );
     }
 
-    fn embed_image(&mut self, mime: &str, bytes: Vec<u8>, width: f64, height: f64) {
+    fn embed_image(
+        &mut self,
+        mime: &str,
+        bytes: Vec<u8>,
+        width: f64,
+        height: f64,
+        positioned: Option<(f64, f64)>,
+    ) {
         let ext = mime_to_ext(mime);
         let index = self.images.len() + 1;
         let drawing_id = self.next_drawing_id;
@@ -1213,14 +1577,36 @@ impl Emitter<'_> {
         let cy = (height * 12700.0).round() as i64;
         let align = self.align.as_deref().unwrap_or("left");
 
+        let (start, end) = if let Some((x, y)) = positioned {
+            let x = (x * 12700.0).round() as i64;
+            let y = (y * 12700.0).round() as i64;
+            (
+                format!(
+                    "<wp:anchor xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
+                     distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" simplePos=\"0\" \
+                     relativeHeight=\"251658240\" behindDoc=\"0\" locked=\"0\" \
+                     layoutInCell=\"1\" allowOverlap=\"1\"><wp:simplePos x=\"0\" y=\"0\"/>\
+                     <wp:positionH relativeFrom=\"page\"><wp:posOffset>{x}</wp:posOffset></wp:positionH>\
+                     <wp:positionV relativeFrom=\"page\"><wp:posOffset>{y}</wp:posOffset></wp:positionV>\
+                     <wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:wrapTopAndBottom wrapText=\"bothSides\"/>"
+                ),
+                "</wp:anchor>",
+            )
+        } else {
+            (
+                format!(
+                    "<wp:inline xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
+                     distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\"><wp:extent cx=\"{cx}\" cy=\"{cy}\"/>"
+                ),
+                "</wp:inline>",
+            )
+        };
+
         self.out.push_str(&format!(
             "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" \
              w:lineRule=\"auto\"/><w:jc w:val=\"{align}\"/></w:pPr>\
-             <w:r><w:drawing><wp:inline \
-             xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
-             distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
-             <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
-              <wp:docPr id=\"{drawing_id}\" name=\"Picture {index}\"/>\
+             <w:r><w:drawing>{start}\
+               <wp:docPr id=\"{drawing_id}\" name=\"Picture {index}\"/>\
              <a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
              <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
              <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
@@ -1230,7 +1616,7 @@ impl Emitter<'_> {
              <a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
              <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
              <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>\
-             </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+              </pic:pic></a:graphicData></a:graphic>{end}</w:drawing></w:r></w:p>"
         ));
     }
 
@@ -1295,30 +1681,60 @@ impl Emitter<'_> {
              <w:jc w:val=\"center\"/></w:pPr><m:oMath>",
             cell(center)
         ));
-        for child in &el.children {
-            self.out.push_str(&omml_node(child));
-        }
+        self.out.push_str(&omml_children(&el.children));
         self.out.push_str("</m:oMath></w:p></w:tc>");
+        let number = el
+            .attrs
+            .get(attr::data_typst_equation_number)
+            .filter(|number| !number.is_empty())
+            .map(|number| self.equation_number(number))
+            .unwrap_or_default();
         self.out.push_str(&format!(
             "<w:tc>{}<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/>\
              <w:jc w:val=\"right\"/></w:pPr>{}</w:p></w:tc></w:tr></w:tbl>",
             cell(side),
-            el.attrs
-                .get(attr::data_typst_equation_number)
-                .filter(|number| !number.is_empty())
-                .map(|number| {
-                    format!(
-                        "<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>",
-                        escape_xml(number)
-                    )
-                })
-                .unwrap_or_default()
+            number
         ));
+    }
+
+    /// Make simple numeric equation numbers update when equations are inserted
+    /// or reordered in Word. Unsupported multi-level formats remain literal.
+    fn equation_number(&mut self, number: &str) -> String {
+        let value_text = number
+            .trim()
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or(number.trim());
+        let Ok(value) = value_text.parse::<u64>() else {
+            return format!(
+                "<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                escape_xml(number)
+            );
+        };
+        let (prefix, suffix) = if number.trim().starts_with('(') {
+            ("(", ")")
+        } else {
+            ("", "")
+        };
+        let reset = if value != self.equation_counter + 1 {
+            format!(" \\r {value}")
+        } else {
+            String::new()
+        };
+        self.equation_counter = value;
+        format!(
+            "<w:r><w:t xml:space=\"preserve\">{prefix}</w:t></w:r>\
+             <w:fldSimple w:instr=\" SEQ Equation{reset} \\* ARABIC \">\
+             <w:r><w:t>{value}</w:t></w:r></w:fldSimple>\
+             <w:r><w:t xml:space=\"preserve\">{suffix}</w:t></w:r>"
+        )
     }
 
     fn filled_box(&mut self, el: &HtmlElement) {
         let style = el.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
-        let color = style.split(';').find_map(|part| part.trim().strip_prefix("background-color:"))
+        let color = style
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("background-color:"))
             .map(|value| value.trim().trim_start_matches('#').to_ascii_uppercase())
             .unwrap_or_else(|| "FFFFFF".into());
         let (top, right, bottom, left) = parse_padding(style).unwrap_or((0, 0, 0, 0));
@@ -1326,8 +1742,10 @@ impl Emitter<'_> {
             let radius = parse_radius(style);
             if radius > 0.0 { radius } else { 4.0 }
         };
-        let available_width = (self.content_width_pt - (left + right) as f64 / 20.0).max(1.0);
-        let line_count = ((text_len(el) as f64 * 5.25 / available_width).ceil() as i64).max(1);
+        let available_width =
+            (self.content_width_pt - (left + right) as f64 / 20.0).max(1.0);
+        let line_count =
+            ((text_len(el) as f64 * 5.25 / available_width).ceil() as i64).max(1);
         let height_twips = top + bottom + line_count * 210;
         let width_emu = (self.content_width_pt * 12700.0).round() as i64;
         let height_emu = (height_twips as f64 * 635.0).round() as i64;
@@ -1336,7 +1754,8 @@ impl Emitter<'_> {
         let bottom_emu = bottom * 635;
         let left_emu = left * 635;
         let height_pt = height_twips as f64 / 20.0;
-        let adjustment = ((100000.0 * radius_pt / self.content_width_pt.min(height_pt)).round() as i64)
+        let adjustment = ((100000.0 * radius_pt / self.content_width_pt.min(height_pt))
+            .round() as i64)
             .clamp(0, 50000);
         let drawing_id = self.next_drawing_id;
         self.next_drawing_id += 1;
@@ -1375,81 +1794,49 @@ impl Emitter<'_> {
             return;
         }
 
-        let mut groups: Vec<Vec<&HtmlNode>> = vec![Vec::new()];
+        let gap = (gap_pt * 20.0).round().max(0.0) as i64;
+        let column_width =
+            (self.content_width_pt - gap_pt * (count as f64 - 1.0)).max(1.0) / count as f64;
+        let previous_width = self.content_width_pt;
+        let previous_columns = self.in_columns;
+        let previous_start = self.column_start;
+
+        // A section break before and after the region enables native Word
+        // column flow, including moving text to another column while editing.
+        let start_section = self.section_marker(1, 0);
+        self.out.push_str(&start_section);
+        self.content_width_pt = column_width;
+        self.in_columns = true;
+        self.column_start = true;
         for child in &el.children {
-            if matches!(child, HtmlNode::Element(break_el) if break_el.attrs.get(attr::class).map(|c| c.as_str()) == Some("typst-colbreak")) {
-                groups.push(Vec::new());
-            } else {
-                groups.last_mut().unwrap().push(child);
-            }
+            self.block(child);
         }
+        self.in_columns = previous_columns;
+        self.column_start = previous_start;
+        self.content_width_pt = previous_width;
+        let end_section = self.section_marker(count, gap);
+        self.out.push_str(&end_section);
+        self.terminal_columns = Some((count, gap));
+    }
 
-        let total = (self.content_width_pt * 20.0).round().max(count as f64) as i64;
-        let gap = ((gap_pt * 20.0).round() as i64).clamp(0, (total - count as i64) / (count as i64 - 1));
-        let content = (total - gap * (count as i64 - 1)) / count as i64;
-        let left_gap = gap / 2;
-        let right_gap = gap - left_gap;
-        let mut tracks = (0..count)
-            .map(|index| {
-                content + (if index > 0 { left_gap } else { 0 })
-                    + (if index + 1 < count { right_gap } else { 0 })
-            })
-            .collect::<Vec<_>>();
-        let remainder = total - tracks.iter().sum::<i64>();
-        *tracks.last_mut().unwrap() += remainder;
-
-        self.out.push_str(&format!(
-            "<w:tbl><w:tblPr><w:tblW w:w=\"{total}\" w:type=\"dxa\"/>\
-             <w:tblInd w:w=\"0\" w:type=\"dxa\"/><w:tblLayout w:type=\"fixed\"/>\
-             <w:tblBorders><w:top w:val=\"nil\"/><w:left w:val=\"nil\"/>\
-             <w:bottom w:val=\"nil\"/><w:right w:val=\"nil\"/>\
-             <w:insideH w:val=\"nil\"/><w:insideV w:val=\"nil\"/></w:tblBorders>\
-             <w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
-             <w:left w:w=\"0\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/>\
-             <w:right w:w=\"0\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr><w:tblGrid>"
-        ));
-        for width in &tracks {
-            self.out.push_str(&format!("<w:gridCol w:w=\"{width}\"/>"));
-        }
-        self.out.push_str("</w:tblGrid>");
-
-        for row in groups.chunks(count) {
-            self.out.push_str("<w:tr>");
-            for index in 0..count {
-                let width = tracks[index];
-                let left = if index > 0 { left_gap } else { 0 };
-                let right = if index + 1 < count { right_gap } else { 0 };
-                self.out.push_str(&format!(
-                    "<w:tc><w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>\
-                     <w:tcMar><w:top w:w=\"0\" w:type=\"dxa\"/>\
-                     <w:left w:w=\"{left}\" w:type=\"dxa\"/>\
-                     <w:bottom w:w=\"0\" w:type=\"dxa\"/>\
-                     <w:right w:w=\"{right}\" w:type=\"dxa\"/></w:tcMar>\
-                     <w:vAlign w:val=\"top\"/></w:tcPr>"
-                ));
-                let start = self.out.len();
-                if let Some(nodes) = row.get(index) {
-                    let previous_width = self.content_width_pt;
-                    let previous_columns = self.in_columns;
-                    let previous_start = self.column_start;
-                    self.content_width_pt = content as f64 / 20.0;
-                    self.in_columns = true;
-                    self.column_start = true;
-                    for node in nodes {
-                        self.block(node);
-                    }
-                    self.column_start = previous_start;
-                    self.in_columns = previous_columns;
-                    self.content_width_pt = previous_width;
-                }
-                if self.out.len() == start {
-                    self.out.push_str("<w:p/>");
-                }
-                self.out.push_str("</w:tc>");
-            }
-            self.out.push_str("</w:tr>");
-        }
-        self.out.push_str("</w:tbl>");
+    /// End a continuous section. The section settings are attached to its
+    /// ending paragraph per WordprocessingML; the following section receives
+    /// its own settings from the next section marker or final body `sectPr`.
+    fn section_marker(&mut self, columns: usize, gap: i64) -> String {
+        let base = self.section_template.as_deref().unwrap_or("<w:sectPr/>");
+        let inner = base
+            .strip_prefix("<w:sectPr>")
+            .and_then(|value| value.strip_suffix("</w:sectPr>"))
+            .unwrap_or("");
+        let split = inner.find("<w:pgSz").unwrap_or(inner.len());
+        let (references, geometry) = inner.split_at(split);
+        let section = format!(
+            "{references}<w:type w:val=\"continuous\"/>{geometry}<w:cols w:num=\"{columns}\" w:space=\"{gap}\" w:equalWidth=\"1\"/>"
+        );
+        format!(
+            "<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"1\" w:lineRule=\"exact\"/>\
+             <w:sectPr>{section}</w:sectPr></w:pPr></w:p>"
+        )
     }
 
     fn table(&mut self, el: &HtmlElement) {
@@ -1458,7 +1845,11 @@ impl Emitter<'_> {
         if rows.is_empty() {
             return;
         }
-        if self.blocks.last().is_some_and(|previous| previous.style == "Heading1") {
+        if self
+            .blocks
+            .last()
+            .is_some_and(|previous| previous.style == "Heading1")
+        {
             // A table has no paragraph spacing of its own in Word. Typst
             // leaves a little more space after a section title than Word's
             // heading line box supplies before the table border.
@@ -1483,51 +1874,74 @@ impl Emitter<'_> {
                 if c.tag != tag::td && c.tag != tag::th {
                     continue;
                 }
-                let colspan = c.attrs.get(attr::colspan)
+                let colspan = c
+                    .attrs
+                    .get(attr::colspan)
                     .and_then(|value| value.as_str().parse::<usize>().ok())
-                    .unwrap_or(1).max(1);
+                    .unwrap_or(1)
+                    .max(1);
                 // A spanning cell's content belongs to the combined tracks;
                 // assigning its whole width to the first `auto` track makes
                 // narrow tables (e.g. Outlook) much too wide.
                 if colspan == 1 && index < cols {
                     col_chars[index] = col_chars[index].max(text_len(c));
                     if let Some(width) = self.measure_width(&text_of(c)) {
-                        col_content[index] = Some(col_content[index].unwrap_or(0.0).max(width));
+                        col_content[index] =
+                            Some(col_content[index].unwrap_or(0.0).max(width));
                     }
                 } else if colspan > 1 {
-                    let share = self.measure_width(&text_of(c))
-                        .unwrap_or(text_len(c) as f64 * 5.25) / colspan as f64;
+                    let share = self
+                        .measure_width(&text_of(c))
+                        .unwrap_or(text_len(c) as f64 * 5.25)
+                        / colspan as f64;
                     for track in index..index.saturating_add(colspan).min(cols) {
-                        col_content[track] = Some(col_content[track].unwrap_or(0.0).max(share));
+                        col_content[track] =
+                            Some(col_content[track].unwrap_or(0.0).max(share));
                     }
                 }
                 index += colspan;
             }
         }
-        let (mut widths, gap) = resolve_tracks(style, self.content_width_pt, &col_content, &col_chars);
+        let (mut widths, gap) =
+            resolve_tracks(style, self.content_width_pt, &col_content, &col_chars);
+        let borderless = el.attrs.get(attr::class).map(|c| c.as_str()) == Some("grid");
         if widths.len() != cols {
             widths = vec![3000; cols];
+        }
+        if borderless {
+            let width_count = widths.len();
+            for (index, width) in widths.iter_mut().enumerate() {
+                if index > 0 {
+                    *width += gap / 2;
+                }
+                if index + 1 < width_count {
+                    *width += gap - gap / 2;
+                }
+            }
         }
         let gap_half = gap / 2;
         let total: i64 = widths.iter().sum();
         // A `grid` is borderless (unlike a `table`), so only style tables.
-        let borderless = el.attrs.get(attr::class).map(|c| c.as_str()) == Some("grid");
-        let tbl_style = if borderless {
-            ""
-        } else {
-            "<w:tblStyle w:val=\"TableGrid\"/>"
-        };
+        let tbl_style = if borderless { "" } else { "<w:tblStyle w:val=\"TableGrid\"/>" };
 
         let table_align = self.align.as_deref().unwrap_or("left");
         // Word places the left edge of a left-aligned table outside the text
         // margin by its first cell's left margin. Typst aligns the table's
         // border with the text margin instead, so offset the Word table by
         // that same amount. Centered/right-aligned tables need no correction.
-        let first_cell_left = rows[0].children.iter().find_map(|node| {
-            let HtmlNode::Element(cell) = node else { return None };
-            if cell.tag != tag::td && cell.tag != tag::th { return None; }
-            cell.attrs.get(attr::style).and_then(|style| parse_padding(style).map(|(_, _, _, left)| left))
-        }).unwrap_or(gap_half);
+        let first_cell_left = rows[0]
+            .children
+            .iter()
+            .find_map(|node| {
+                let HtmlNode::Element(cell) = node else { return None };
+                if cell.tag != tag::td && cell.tag != tag::th {
+                    return None;
+                }
+                cell.attrs
+                    .get(attr::style)
+                    .and_then(|style| parse_padding(style).map(|(_, _, _, left)| left))
+            })
+            .unwrap_or(gap_half);
         let table_indent = if table_align == "left" {
             format!("<w:tblInd w:w=\"{first_cell_left}\" w:type=\"dxa\"/>")
         } else {
@@ -1560,6 +1974,7 @@ impl Emitter<'_> {
                     .and_then(|value| value.as_str().parse::<usize>().ok())
                     .unwrap_or(1)
                     .max(1);
+                let start_cell = cells;
                 let mut width = 0;
                 for offset in 0..colspan {
                     width += widths.get(cells + offset).copied().unwrap_or(3000);
@@ -1569,13 +1984,13 @@ impl Emitter<'_> {
                 if colspan > 1 {
                     self.out.push_str(&format!("<w:gridSpan w:val=\"{colspan}\"/>"));
                 }
-                self.out
-                    .push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/>"));
+                self.out.push_str(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/>"));
                 // `table.header` marks the header row for repetition, it does
                 // not style it, so header cells stay plain like Typst's.
-                let cell_style = c.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
+                let cell_style =
+                    c.attrs.get(attr::style).map(|s| s.as_str()).unwrap_or("");
                 let previous = self.align.clone();
-                if let Some(align) = parse_text_align(cell_style) {
+                if let Some(align) = nested_text_align(c) {
                     self.align = Some(align);
                 }
                 if let Some((top, right, bottom, left)) = parse_padding(cell_style) {
@@ -1587,6 +2002,10 @@ impl Emitter<'_> {
                     let word_vertical = |twips: i64| (twips as f64 * 0.65).round() as i64;
                     let top = word_vertical(top);
                     let bottom = word_vertical(bottom);
+                    let grid_left = if borderless && start_cell > 0 { gap_half } else { 0 };
+                    let grid_right = if borderless && cells < cols { gap_half } else { 0 };
+                    let left = left + grid_left;
+                    let right = right + grid_right;
                     self.out.push_str(&format!(
                         "<w:tcMar><w:top w:w=\"{top}\" w:type=\"dxa\"/>\
                          <w:left w:w=\"{left}\" w:type=\"dxa\"/>\
@@ -1594,14 +2013,36 @@ impl Emitter<'_> {
                          <w:right w:w=\"{right}\" w:type=\"dxa\"/></w:tcMar>"
                     ));
                 }
+                let grid_left = if borderless && start_cell > 0 { gap_half } else { 0 };
+                let grid_right = if borderless && cells < cols { gap_half } else { 0 };
+                let (cell_left, cell_right) = parse_padding(cell_style)
+                    .map(|(_, right, _, left)| (left, right))
+                    .unwrap_or((0, 0));
+                let cell_left = cell_left + grid_left;
+                let cell_right = cell_right + grid_right;
+                let cell_content_width_pt =
+                    (width - cell_left - cell_right).max(1) as f64 / 20.0;
                 self.out.push_str("</w:tcPr>");
                 self.in_cell = true;
-                let runs = inline(&c.children, false, false, false, None);
-                // Cells always contain at least one paragraph.
-                if runs.is_empty() {
-                    self.paragraph("Normal", &[], None);
+                if let [HtmlNode::Element(box_el)] = c.children.as_slice()
+                    && box_el.tag == tag::span
+                    && box_el
+                        .attrs
+                        .get(attr::style)
+                        .is_some_and(|style| style.contains("background-color:"))
+                {
+                    let previous_width = self.content_width_pt;
+                    self.content_width_pt = cell_content_width_pt;
+                    self.filled_box(box_el);
+                    self.content_width_pt = previous_width;
                 } else {
-                    self.paragraph("Normal", &runs, None);
+                    let runs = inline(&c.children, false, false, false, None);
+                    // Cells always contain at least one paragraph.
+                    if runs.is_empty() {
+                        self.paragraph("Normal", &[], None);
+                    } else {
+                        self.paragraph("Normal", &runs, None);
+                    }
                 }
                 self.align = previous;
                 self.in_cell = false;
@@ -1636,21 +2077,142 @@ fn collect_rows<'a>(el: &'a HtmlElement, rows: &mut Vec<&'a HtmlElement>) {
 fn omml_node(node: &HtmlNode) -> String {
     let HtmlNode::Element(el) = node else {
         if let HtmlNode::Text(text, _) = node {
-            return format!("<m:r><m:t xml:space=\"preserve\">{}</m:t></m:r>", escape_xml(text));
+            return format!(
+                "<m:r><m:t xml:space=\"preserve\">{}</m:t></m:r>",
+                escape_xml(text)
+            );
         }
         return String::new();
     };
     let child = |index: usize| el.children.get(index).map(omml_node).unwrap_or_default();
     let body = || el.children.iter().map(omml_node).collect::<String>();
     match el.tag {
-        t if t == tag::mathml::mfrac => format!("<m:f><m:num>{}</m:num><m:den>{}</m:den></m:f>", child(0), child(1)),
-        t if t == tag::mathml::msup => format!("<m:sSup><m:e>{}</m:e><m:sup>{}</m:sup></m:sSup>", child(0), child(1)),
-        t if t == tag::mathml::msub => format!("<m:sSub><m:e>{}</m:e><m:sub>{}</m:sub></m:sSub>", child(0), child(1)),
-        t if t == tag::mathml::msubsup => format!("<m:sSubSup><m:e>{}</m:e><m:sub>{}</m:sub><m:sup>{}</m:sup></m:sSubSup>", child(0), child(1), child(2)),
-        t if t == tag::mathml::msqrt => format!("<m:rad><m:radPr><m:degHide m:val=\"1\"/></m:radPr><m:deg/><m:e>{}</m:e></m:rad>", body()),
-        t if t == tag::mathml::mspace => "<m:r><m:t xml:space=\"preserve\"> </m:t></m:r>".into(),
+        t if t == tag::mathml::mfrac => {
+            format!("<m:f><m:num>{}</m:num><m:den>{}</m:den></m:f>", child(0), child(1))
+        }
+        t if t == tag::mathml::msup => {
+            format!("<m:sSup><m:e>{}</m:e><m:sup>{}</m:sup></m:sSup>", child(0), child(1))
+        }
+        t if t == tag::mathml::msub => {
+            format!("<m:sSub><m:e>{}</m:e><m:sub>{}</m:sub></m:sSub>", child(0), child(1))
+        }
+        t if t == tag::mathml::msubsup => {
+            let operator = match el.children.first() {
+                Some(HtmlNode::Element(operator)) => text_of(operator),
+                Some(HtmlNode::Text(text, _)) => text.to_string(),
+                _ => String::new(),
+            };
+            if is_nary(&operator) {
+                format!(
+                    "<m:nary><m:naryPr><m:chr m:val=\"{}\"/><m:limLoc m:val=\"undOvr\"/></m:naryPr><m:sub>{}</m:sub><m:sup>{}</m:sup><m:e/></m:nary>",
+                    escape_xml(&operator), child(1), child(2)
+                )
+            } else {
+                format!(
+                    "<m:sSubSup><m:e>{}</m:e><m:sub>{}</m:sub><m:sup>{}</m:sup></m:sSubSup>",
+                    child(0), child(1), child(2)
+                )
+            }
+        }
+        t if t == tag::mathml::msqrt => format!(
+            "<m:rad><m:radPr><m:degHide m:val=\"1\"/></m:radPr><m:deg/><m:e>{}</m:e></m:rad>",
+            body()
+        ),
+        t if t == tag::mathml::mspace => {
+            "<m:r><m:t xml:space=\"preserve\"> </m:t></m:r>".into()
+        }
+        t if t == tag::mathml::mtable => omml_table(el),
         _ => body(),
     }
+}
+
+fn omml_table(el: &HtmlElement) -> String {
+    let aligned = el
+        .attrs
+        .get(attr::class)
+        .is_some_and(|class| class.split_whitespace().any(|name| name == "aligned"));
+    let rows = el
+        .children
+        .iter()
+        .filter_map(|row| match row {
+            HtmlNode::Element(row) if row.tag == tag::mathml::mtr => {
+                let cells = row
+                    .children
+                    .iter()
+                    .filter_map(|cell| match cell {
+                        HtmlNode::Element(cell) if cell.tag == tag::mathml::mtd => {
+                            Some(omml_children(&cell.children))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                Some(if aligned {
+                    format!(
+                        "<m:e>{}</m:e>",
+                        cells.join("<m:aln/>")
+                    )
+                } else {
+                    format!("<m:mr>{}</m:mr>", cells.iter().map(|cell| format!("<m:e>{cell}</m:e>")).collect::<String>())
+                })
+            }
+            _ => None,
+        })
+        .collect::<String>();
+    if aligned {
+        format!("<m:eqArr><m:eqArrPr><m:baseJc m:val=\"center\"/></m:eqArrPr>{rows}</m:eqArr>")
+    } else {
+        format!("<m:m><m:mPr><m:baseJc m:val=\"center\"/></m:mPr>{rows}</m:m>")
+    }
+}
+
+/// Convert MathML children to OMML. For an n-ary operator, gather following
+/// expression nodes into its body up to the next relation operator.
+fn omml_children(nodes: &[HtmlNode]) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < nodes.len() {
+        let nary = match &nodes[index] {
+            HtmlNode::Element(element) if element.tag == tag::mathml::msubsup => {
+                let operator = element.children.first().map(node_text).unwrap_or_default();
+                is_nary(&operator).then_some((element, operator))
+            }
+            _ => None,
+        };
+        if let Some((element, operator)) = nary {
+            let mut body = String::new();
+            index += 1;
+            while index < nodes.len() && !is_relation_node(&nodes[index]) {
+                body.push_str(&omml_node(&nodes[index]));
+                index += 1;
+            }
+            out.push_str(&format!(
+                "<m:nary><m:naryPr><m:chr m:val=\"{}\"/><m:limLoc m:val=\"undOvr\"/></m:naryPr><m:sub>{}</m:sub><m:sup>{}</m:sup><m:e>{body}</m:e></m:nary>",
+                escape_xml(&operator),
+                element.children.get(1).map(omml_node).unwrap_or_default(),
+                element.children.get(2).map(omml_node).unwrap_or_default(),
+            ));
+        } else {
+            out.push_str(&omml_node(&nodes[index]));
+            index += 1;
+        }
+    }
+    out
+}
+
+fn node_text(node: &HtmlNode) -> String {
+    match node {
+        HtmlNode::Element(element) => text_of(element),
+        HtmlNode::Text(text, _) => text.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn is_relation_node(node: &HtmlNode) -> bool {
+    matches!(node, HtmlNode::Element(element) if element.tag == tag::mathml::mo && matches!(text_of(element).trim(), "=" | "<" | ">" | "≤" | "≥" | "≠"))
+}
+
+fn is_nary(operator: &str) -> bool {
+    matches!(operator.trim(), "∫" | "∑" | "∏" | "∐" | "∩" | "∪")
 }
 
 fn inline(
@@ -1695,14 +2257,18 @@ fn collect_inline(
         HtmlNode::Element(el) => {
             let t = el.tag;
             if t == tag::mathml::math {
-                let mut math = String::from("<m:oMath>");
-                for child in &el.children {
-                    math.push_str(&omml_node(child));
-                }
-                math.push_str("</m:oMath>");
+                let math = format!("<m:oMath>{}</m:oMath>", omml_children(&el.children));
                 runs.push(Run {
-                    text: text_of(el), math_xml: Some(math), bold, italic, mono,
-                    br: false, href: None, footnote_ref: None, strike: false, highlight: false,
+                    text: text_of(el),
+                    math_xml: Some(math),
+                    bold,
+                    italic,
+                    mono,
+                    br: false,
+                    href: None,
+                    footnote_ref: None,
+                    strike: false,
+                    highlight: false,
                 });
                 return;
             }
@@ -1848,7 +2414,8 @@ fn resolve_tracks(
                     // differ from Typst, so an exact width would wrap). Falls
                     // back to a character-count estimate.
                     let measured = col_content.get(index).copied().flatten();
-                    let estimate = col_chars.get(index).copied().unwrap_or(0) as f64 * 5.25;
+                    let estimate =
+                        col_chars.get(index).copied().unwrap_or(0) as f64 * 5.25;
                     // Typst's 7pt inset on either side is part of the track;
                     // leave one point for Word's differing text metrics.
                     fixed.push(Some(measured.unwrap_or(estimate) + 15.0));
@@ -1873,11 +2440,7 @@ fn resolve_tracks(
     let free = (available_pt - total_gap).max(0.0);
     let fixed_sum: f64 = fixed.iter().flatten().sum();
     let flex_sum: f64 = flex.iter().sum();
-    let unit = if flex_sum > 0.0 {
-        (free - fixed_sum).max(0.0) / flex_sum
-    } else {
-        0.0
-    };
+    let unit = if flex_sum > 0.0 { (free - fixed_sum).max(0.0) / flex_sum } else { 0.0 };
 
     let widths = fixed
         .iter()
@@ -1897,13 +2460,17 @@ fn parse_columns_style(style: &str, available_pt: f64) -> (usize, f64) {
             count = value.trim().parse::<usize>().unwrap_or(1).max(1);
         } else if let Some(value) = declaration.strip_prefix("column-gap:") {
             let value = value.trim();
-            let value = value.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')).unwrap_or(value);
+            let value = value
+                .strip_prefix("calc(")
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(value);
             for part in value.split('+') {
                 let part = part.trim();
                 if let Some(pt) = part.strip_suffix("pt") {
                     gap += pt.trim().parse::<f64>().unwrap_or(0.0);
                 } else if let Some(percent) = part.strip_suffix('%') {
-                    gap += percent.trim().parse::<f64>().unwrap_or(0.0) * available_pt / 100.0;
+                    gap += percent.trim().parse::<f64>().unwrap_or(0.0) * available_pt
+                        / 100.0;
                 }
             }
         }
@@ -2002,8 +2569,15 @@ fn parse_hr_style(style: &str) -> (f64, String) {
 
 fn parse_pt_property(style: &str, property: &str) -> Option<i64> {
     style.split(';').find_map(|declaration| {
-        declaration.trim().strip_prefix(property)?.trim().strip_suffix("pt")?
-            .trim().parse::<f64>().ok().map(|pt| (pt * 20.0).round() as i64)
+        declaration
+            .trim()
+            .strip_prefix(property)?
+            .trim()
+            .strip_suffix("pt")?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|pt| (pt * 20.0).round() as i64)
     })
 }
 
@@ -2019,12 +2593,19 @@ fn caption_number(runs: &[Run]) -> Option<(usize, String, u64)> {
         }
         let label = runs[..index].iter().map(|run| run.text.as_str()).collect::<String>();
         let label = label.trim();
-        let following = runs[index + 1..].iter().map(|run| run.text.as_str()).collect::<String>();
+        let following = runs[index + 1..]
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
         // A numbering pattern such as `1.1` cannot be represented by a simple
         // SEQ field. Do not turn its first component into a separate counter.
-        let decimal_continues = following.strip_prefix('.')
+        let decimal_continues = following
+            .strip_prefix('.')
             .is_some_and(|tail| tail.chars().next().is_some_and(|c| c.is_ascii_digit()));
-        if !decimal_continues && !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphabetic()) {
+        if !decimal_continues
+            && !label.is_empty()
+            && label.bytes().all(|b| b.is_ascii_alphabetic())
+        {
             return Some((index, label.to_string(), run.text.parse().ok()?));
         }
     }
@@ -2080,6 +2661,11 @@ fn parse_text_align(style: &str) -> Option<String> {
     None
 }
 
+fn is_monospace_family(family: &str) -> bool {
+    let family = family.to_ascii_lowercase();
+    family.contains("mono") || family.contains("courier") || family.contains("consolas")
+}
+
 /// Normalize text for matching: keep alphanumerics, collapse whitespace and
 /// lowercase, so quotes, dashes and other decoration don't break the match.
 fn collapse(text: &str) -> String {
@@ -2087,7 +2673,11 @@ fn collapse(text: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
-    filtered.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    filtered
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Derive per-style block spacing and indentation from the layout.
@@ -2131,7 +2721,9 @@ fn compute_spacing(
     let mut line: HashMap<&str, Vec<f64>> = HashMap::new();
 
     for (index, block) in blocks.iter().enumerate() {
-        if block.in_columns { continue; }
+        if block.in_columns {
+            continue;
+        }
         let Some(first) = firsts[index] else { continue };
         let Some(last) = block_last(runs, &firsts, index) else { continue };
         let style = block.style.as_str();
@@ -2149,7 +2741,9 @@ fn compute_spacing(
             }
         }
 
-        if blocks.get(index + 1).is_some_and(|next| next.in_columns) { continue; }
+        if blocks.get(index + 1).is_some_and(|next| next.in_columns) {
+            continue;
+        }
         let Some(next) = firsts.get(index + 1).copied().flatten() else { continue };
         if runs[next].page == runs[first].page {
             let top = runs[next].y_pt - runs[next].ascent_pt;
@@ -2252,7 +2846,10 @@ fn mode_typography(list: &[Typography]) -> Option<Typography> {
             None => counts.push((typo.clone(), 1)),
         }
     }
-    counts.into_iter().max_by_key(|(_, count)| *count).map(|(typo, _)| typo)
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(typo, _)| typo)
 }
 
 fn escape_xml(text: &str) -> String {
@@ -2291,11 +2888,7 @@ fn sect_pr(
             let margin = page.margin;
             let twips = |abs: Abs| (abs.to_pt() * 20.0).round() as i64;
             (
-                format!(
-                    "<w:pgSz w:w=\"{}\" w:h=\"{}\"/>",
-                    twips(size.x),
-                    twips(size.y)
-                ),
+                format!("<w:pgSz w:w=\"{}\" w:h=\"{}\"/>", twips(size.x), twips(size.y)),
                 format!(
                     "<w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" \
                      w:header=\"{header_dist}\" w:footer=\"{footer_dist}\" w:gutter=\"0\"/>",
@@ -2380,16 +2973,14 @@ fn package(
     let mut zip = ZipWriter::new(cursor);
     let opts = SimpleFileOptions::default();
 
-    let write = |zip: &mut ZipWriter<Cursor<Vec<u8>>>,
-                 name: &str,
-                 data: &str|
-     -> StrResult<()> {
-        zip.start_file(name, opts)
-            .map_err(|e| eco_format!("zip error: {e}"))?;
-        zip.write_all(data.as_bytes())
-            .map_err(|e| eco_format!("zip write error: {e}"))?;
-        Ok(())
-    };
+    let write =
+        |zip: &mut ZipWriter<Cursor<Vec<u8>>>, name: &str, data: &str| -> StrResult<()> {
+            zip.start_file(name, opts)
+                .map_err(|e| eco_format!("zip error: {e}"))?;
+            zip.write_all(data.as_bytes())
+                .map_err(|e| eco_format!("zip write error: {e}"))?;
+            Ok(())
+        };
 
     write(
         &mut zip,
@@ -2400,11 +2991,21 @@ fn package(
     write(&mut zip, "word/document.xml", document_xml)?;
     write(&mut zip, "word/styles.xml", styles)?;
     write(&mut zip, "word/numbering.xml", numbering)?;
-    write(&mut zip, "word/settings.xml", r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:updateFields w:val="true"/></w:settings>"#)?;
+    write(
+        &mut zip,
+        "word/settings.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:updateFields w:val="true"/><w:autoHyphenation w:val="true"/><w:consecutiveHyphenLimit w:val="2"/><w:hyphenationZone w:val="360"/></w:settings>"#,
+    )?;
     write(
         &mut zip,
         "word/_rels/document.xml.rels",
-        &document_rels(header.is_some(), footer.is_some(), images, hyperlinks, !footnotes.is_empty()),
+        &document_rels(
+            header.is_some(),
+            footer.is_some(),
+            images,
+            hyperlinks,
+            !footnotes.is_empty(),
+        ),
     )?;
     if let Some(header) = header {
         write(&mut zip, "word/header1.xml", header)?;
@@ -2433,7 +3034,12 @@ const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
 </Relationships>"#;
 
 /// The `[Content_Types].xml` part, including header/footer and image overrides.
-fn content_types(header: bool, footer: bool, images: &[Media], footnotes: bool) -> String {
+fn content_types(
+    header: bool,
+    footer: bool,
+    images: &[Media],
+    footnotes: bool,
+) -> String {
     let mut out = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -2575,26 +3181,10 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
 
     let spacing_patches: [(&str, &str, bool); 6] = [
         ("Title", "<w:spacing w:before=\"240\" w:after=\"120\"/>", false),
-        (
-            "Heading1",
-            "<w:keepNext/><w:spacing w:before=\"360\" w:after=\"120\"/>",
-            true,
-        ),
-        (
-            "Heading2",
-            "<w:keepNext/><w:spacing w:before=\"240\" w:after=\"80\"/>",
-            true,
-        ),
-        (
-            "Heading3",
-            "<w:keepNext/><w:spacing w:before=\"200\" w:after=\"60\"/>",
-            true,
-        ),
-        (
-            "Heading4",
-            "<w:keepNext/><w:spacing w:before=\"180\" w:after=\"60\"/>",
-            true,
-        ),
+        ("Heading1", "<w:keepNext/><w:spacing w:before=\"360\" w:after=\"120\"/>", true),
+        ("Heading2", "<w:keepNext/><w:spacing w:before=\"240\" w:after=\"80\"/>", true),
+        ("Heading3", "<w:keepNext/><w:spacing w:before=\"200\" w:after=\"60\"/>", true),
+        ("Heading4", "<w:keepNext/><w:spacing w:before=\"180\" w:after=\"60\"/>", true),
         ("Caption", "<w:spacing w:after=\"160\"/>", false),
     ];
     for (style, anchor, keep_next) in spacing_patches {
@@ -2606,7 +3196,8 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
             let before = if style == "Heading1" { 200 } else { 0 };
             // A heading-to-paragraph gap is small in Typst. The measured
             // Heading1 median included larger gaps to other headings/blocks.
-            let after = if style == "Heading1" { 0 } else { (m.after_pt * 20.0).round() as i64 };
+            let after =
+                if style == "Heading1" { 0 } else { (m.after_pt * 20.0).round() as i64 };
             s = s.replace(anchor, &format!("{keep}{}", spacing(m, before, after)));
         }
     }
@@ -2624,10 +3215,7 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
 
     if let Some(m) = measured.get("Quote") {
         let left = (m.indent_pt * 20.0).round() as i64;
-        s = s.replace(
-            "<w:ind w:left=\"567\"/>",
-            &format!("<w:ind w:left=\"{left}\"/>"),
-        );
+        s = s.replace("<w:ind w:left=\"567\"/>", &format!("<w:ind w:left=\"{left}\"/>"));
     }
 
     // List paragraphs: measured space-below and line pitch, plus the indent
@@ -2636,7 +3224,10 @@ fn styles(measured: &HashMap<&str, Measured>) -> String {
         let left = (m.indent_pt * 20.0).round().max(0.0) as i64;
         s = s.replace(
             "<w:pPr><w:ind w:left=\"720\"/></w:pPr>",
-            &format!("<w:pPr>{}<w:ind w:left=\"{left}\"/></w:pPr>", spacing(m, 0, (m.after_pt * 20.0).round() as i64)),
+            &format!(
+                "<w:pPr>{}<w:ind w:left=\"{left}\"/></w:pPr>",
+                spacing(m, 0, (m.after_pt * 20.0).round() as i64)
+            ),
         );
     }
 
@@ -2650,7 +3241,7 @@ const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:docDefaults>
 <w:rPrDefault><w:rPr>
 <w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>
-<w:sz w:val="22"/><w:szCs w:val="22"/>
+<w:sz w:val="22"/><w:szCs w:val="22"/><w:lang w:val="en-US" w:eastAsia="en-US"/>
 </w:rPr></w:rPrDefault>
 <w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault>
 </w:docDefaults>
@@ -2687,6 +3278,12 @@ const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="34"/><w:qFormat/>
 <w:pPr><w:ind w:left="720"/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="TOCHeading"><w:name w:val="TOC Heading"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="39"/><w:qFormat/>
+<w:pPr><w:keepNext/><w:spacing w:before="0" w:after="120"/></w:pPr><w:rPr><w:b/><w:color w:val="1D6FA5"/><w:sz w:val="28"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="TOC1"><w:name w:val="toc 1"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="39"/><w:qFormat/>
+<w:pPr><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9000"/></w:tabs><w:spacing w:before="0" w:after="40"/></w:pPr><w:rPr><w:sz w:val="20"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="TOC2"><w:name w:val="toc 2"/><w:basedOn w:val="TOC1"/><w:uiPriority w:val="39"/><w:qFormat/>
+<w:pPr><w:ind w:left="240"/><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9000"/></w:tabs></w:pPr><w:rPr><w:sz w:val="20"/></w:rPr></w:style>
 <w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:uiPriority w:val="39"/><w:qFormat/>
 <w:tblPr><w:tblBorders>
 <w:top w:val="single" w:sz="8" w:space="0" w:color="000000"/>
@@ -2724,7 +3321,9 @@ fn numbering(ordered_num_ids: &[u32], indent: i64) -> String {
     out.push_str(&lvl(0, "decimal", "%1."));
     out.push_str(&lvl(1, "lowerLetter", "%2."));
     out.push_str(&lvl(2, "lowerRoman", "%3."));
-    out.push_str("</w:abstractNum><w:num w:numId=\"1\"><w:abstractNumId w:val=\"0\"/></w:num>");
+    out.push_str(
+        "</w:abstractNum><w:num w:numId=\"1\"><w:abstractNumId w:val=\"0\"/></w:num>",
+    );
 
     for &id in ordered_num_ids {
         out.push_str(&format!(
@@ -2768,15 +3367,459 @@ mod tests {
         let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
         em.block(&columns);
 
-        let cells: Vec<_> = em.out.split("<w:tc>").collect();
-        assert_eq!(cells.len(), 3);
-        assert_eq!(em.out.matches("<w:tbl>").count(), 1);
-        assert_eq!(em.out.matches("<w:gridCol w:w=\"4500\"/>").count(), 2);
-        assert_eq!(em.out.matches("<w:t xml:space=\"preserve\">First column body</w:t>").count(), 1);
-        assert_eq!(em.out.matches("<w:t xml:space=\"preserve\">Second column body</w:t>").count(), 1);
-        assert!(cells[1].contains("First column body"));
-        assert!(!cells[1].contains("Second column heading"));
-        assert!(cells[2].contains("Second column heading"));
-        assert!(cells[2].contains("<w:pStyle w:val=\"Heading2\"/><w:spacing w:before=\"0\"/>"));
+        assert_eq!(em.out.matches("<w:sectPr>").count(), 2);
+        assert!(em.out.contains("<w:cols w:num=\"2\" w:space=\"240\" w:equalWidth=\"1\"/>"));
+        assert!(em.out.contains("<w:br w:type=\"column\"/>"));
+        assert!(em.out.contains(
+            "<w:pStyle w:val=\"Heading2\"/><w:spacing w:before=\"0\"/></w:pPr><w:r><w:br w:type=\"column\"/></w:r>"
+        ));
+        assert!(!em.out.contains("<w:p><w:r><w:br w:type=\"column\"/></w:r></w:p>"));
+        assert!(!em.out.contains("<w:tbl>"));
+        assert_eq!(
+            em.out
+                .matches("<w:t xml:space=\"preserve\">First column body</w:t>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            em.out
+                .matches("<w:t xml:space=\"preserve\">Second column body</w:t>")
+                .count(),
+            1
+        );
+        let first = em.out.find("First column body").unwrap();
+        let second = em.out.find("Second column heading").unwrap();
+        assert!(first < second);
+        assert!(em.out.contains("<w:pStyle w:val=\"Heading2\"/><w:spacing w:before=\"0\"/>"));
     }
+
+    #[test]
+    fn positioned_images_use_page_anchored_drawingml() {
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.embed_image(
+            "image/svg+xml",
+            b"<svg/>".to_vec(),
+            100.0,
+            50.0,
+            Some((10.0, 20.0)),
+        );
+
+        assert!(em.out.contains("<wp:anchor"));
+        assert!(em.out.contains("<wp:wrapTopAndBottom wrapText=\"bothSides\"/>"));
+        assert!(em.out.contains("<wp:posOffset>127000</wp:posOffset>"));
+        assert!(em.out.contains("<wp:posOffset>254000</wp:posOffset>"));
+        assert!(!em.out.contains("<wp:inline"));
+    }
+
+    #[test]
+    fn colored_grid_cells_preserve_rounded_box_shapes() {
+        let card: HtmlNode = HtmlElement::new(tag::span)
+            .with_attr(
+                attr::style,
+                "background-color: #EAF3FA; border-radius: 5pt; padding: 9pt 9pt 9pt 9pt",
+            )
+            .with_children(eco_vec![text_element(tag::strong, "Editorial systems")])
+            .into();
+        let table = HtmlElement::new(tag::table)
+            .with_attr(attr::class, "grid")
+            .with_attr(
+                attr::style,
+                "grid-template-columns: 1fr 1fr 1fr; column-gap: 8pt",
+            )
+            .with_children(eco_vec![
+                HtmlElement::new(tag::tr)
+                    .with_children(eco_vec![
+                        HtmlElement::new(tag::td).with_children(eco_vec![card]).into(),
+                        HtmlElement::new(tag::td).into(),
+                        HtmlElement::new(tag::td).into(),
+                    ])
+                    .into(),
+            ]);
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.table(&table);
+
+        assert!(em.out.contains("<a:prstGeom prst=\"roundRect\""));
+        assert!(em.out.contains("<a:srgbClr val=\"EAF3FA\"/>"));
+        assert!(em.out.contains("Editorial systems"));
+        assert!(em.out.contains("<wp:extent cx=\"1837055\""));
+    }
+
+    #[test]
+    fn grid_cell_uses_nested_alignment() {
+        let table = HtmlElement::new(tag::table)
+            .with_attr(attr::class, "grid")
+            .with_attr(attr::style, "grid-template-columns: 1fr 1fr")
+            .with_children(eco_vec![
+                HtmlElement::new(tag::tr)
+                    .with_children(eco_vec![
+                        HtmlElement::new(tag::td)
+                            .with_children(eco_vec![text_element(tag::span, "Left")])
+                            .into(),
+                        HtmlElement::new(tag::td)
+                            .with_children(eco_vec![
+                                HtmlElement::new(tag::div)
+                                    .with_attr(attr::style, "text-align: right")
+                                    .with_children(eco_vec![text_element(tag::span, "Right")])
+                                    .into(),
+                            ])
+                            .into(),
+                    ])
+                    .into(),
+            ]);
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.table(&table);
+
+        assert!(em.out.contains("<w:jc w:val=\"right\"/>"));
+    }
+
+    #[test]
+    fn outline_uses_native_toc_content_control() {
+        let toc = HtmlElement::new(tag::nav)
+            .with_attr(attr::role, "doc-toc")
+            .with_children(eco_vec![
+                text_element(tag::h2, "Contents"),
+                HtmlElement::new(tag::ol)
+                    .with_children(eco_vec![
+                        HtmlElement::new(tag::li)
+                            .with_children(eco_vec![text_element(tag::span, "1 Editorial systems")])
+                            .into(),
+                    ])
+                    .into(),
+            ]);
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.block_el(&toc);
+
+        assert!(em.out.contains("<w:docPartGallery w:val=\"Table of Contents\"/>"));
+        assert!(em.out.contains(" TOC \\o &quot;1-2&quot; \\h \\z \\u "));
+        assert!(em.out.contains("1 Editorial systems"));
+        assert!(em.out.contains("<w:tab w:val=\"right\" w:leader=\"dot\""));
+    }
+
+    #[test]
+    fn region_runs_inherit_measured_paragraph_typography() {
+        let mut em = Emitter::new(&[], 450.0, true, false, Vec::new(), Vec::new(), 0, 0);
+        em.current_typo = Some(Typography {
+            family: "Calibri".into(),
+            size_pt: 8.0,
+            bold: false,
+            italic: false,
+            color: "616161".into(),
+        });
+        em.run(
+            &Run {
+                text: "2026".into(),
+                math_xml: None,
+                bold: false,
+                italic: false,
+                mono: false,
+                br: false,
+                href: None,
+                footnote_ref: None,
+                strike: false,
+                highlight: false,
+            },
+            None,
+            false,
+        );
+
+        assert!(em.out.contains("<w:sz w:val=\"16\"/>"));
+        assert!(em.out.contains("<w:color w:val=\"616161\"/>"));
+    }
+
+    #[test]
+    fn semantic_emphasis_survives_nonbold_layout_match() {
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.run(
+            &Run {
+                text: "Definitions".into(),
+                math_xml: None,
+                bold: true,
+                italic: false,
+                mono: false,
+                br: false,
+                href: None,
+                footnote_ref: None,
+                strike: false,
+                highlight: false,
+            },
+            Some(&Typography {
+                family: "Calibri".into(),
+                size_pt: 10.0,
+                bold: false,
+                italic: false,
+                color: "000000".into(),
+            }),
+            false,
+        );
+
+        assert!(em.out.contains("<w:b/>"));
+    }
+
+    #[test]
+    fn omml_preserves_nary_limits_and_math_tables() {
+        let integral: HtmlNode = HtmlElement::new(tag::mathml::msubsup)
+            .with_children(eco_vec![
+                text_element(tag::mathml::mo, "∫"),
+                text_element(tag::mathml::mi, "a"),
+                text_element(tag::mathml::mi, "b"),
+            ])
+            .into();
+        let matrix: HtmlNode = HtmlElement::new(tag::mathml::mtable)
+            .with_children(eco_vec![
+                HtmlElement::new(tag::mathml::mtr)
+                    .with_children(eco_vec![
+                        HtmlElement::new(tag::mathml::mtd)
+                            .with_children(eco_vec![text_element(tag::mathml::mn, "1")])
+                            .into(),
+                        HtmlElement::new(tag::mathml::mtd)
+                            .with_children(eco_vec![text_element(tag::mathml::mn, "0")])
+                            .into(),
+                    ])
+                    .into(),
+            ])
+            .into();
+
+        assert!(omml_node(&integral).contains("<m:nary>"));
+        assert!(omml_node(&integral).contains("m:limLoc m:val=\"undOvr\""));
+        assert!(omml_node(&matrix).contains("<m:m>"));
+        assert!(omml_node(&matrix).contains("<m:mr>"));
+
+        let operator = HtmlElement::new(tag::mathml::msubsup)
+            .with_children(eco_vec![
+                text_element(tag::mathml::mo, "∫"),
+                text_element(tag::mathml::mi, "−∞"),
+                text_element(tag::mathml::mi, "∞"),
+            ]);
+        let sequence = [
+            HtmlNode::from(operator),
+            text_element(tag::mathml::mi, "e"),
+            text_element(tag::mathml::mo, "="),
+            text_element(tag::mathml::mi, "x"),
+        ];
+        let integral_xml = omml_children(&sequence);
+        assert!(integral_xml.contains("<m:e><m:r><m:t xml:space=\"preserve\">e"));
+        assert!(integral_xml.contains("</m:e></m:nary><m:r>"));
+
+        let aligned = HtmlElement::new(tag::mathml::mtable)
+            .with_attr(attr::class, "multiline-equation aligned")
+            .with_children(eco_vec![
+                HtmlElement::new(tag::mathml::mtr)
+                    .with_children(eco_vec![
+                        HtmlElement::new(tag::mathml::mtd)
+                            .with_children(eco_vec![text_element(tag::mathml::mi, "a")])
+                            .into(),
+                        HtmlElement::new(tag::mathml::mtd)
+                            .with_children(eco_vec![text_element(tag::mathml::mi, "b")])
+                            .into(),
+                    ])
+                    .into(),
+            ]);
+        let aligned_xml = omml_node(&HtmlNode::from(aligned));
+        assert!(aligned_xml.contains("<m:eqArr>"));
+        assert!(aligned_xml.contains("<m:aln/>"));
+    }
+
+    #[test]
+    fn definition_lists_keep_bold_terms_and_colons() {
+        let definitions = HtmlElement::new(tag::dl).with_children(eco_vec![
+            HtmlElement::new(tag::dt)
+                .with_children(eco_vec![text_element(tag::span, "Canvas")])
+                .into(),
+            HtmlElement::new(tag::dd)
+                .with_children(eco_vec![text_element(tag::span, "A coordinate system")])
+                .into(),
+            HtmlElement::new(tag::dt)
+                .with_children(eco_vec![text_element(tag::span, "Grid")])
+                .into(),
+            HtmlElement::new(tag::dd)
+                .with_children(eco_vec![text_element(tag::span, "A layout structure")])
+                .into(),
+        ]);
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.definition_list(&definitions);
+
+        assert!(em.out.contains("<w:b/>"));
+        assert!(em.out.contains(">Canvas</w:t>"));
+        assert!(em.out.contains(">:</w:t>"));
+        assert!(em.out.contains("<w:r><w:tab/></w:r>"));
+        assert!(em.out.contains("w:hanging=\""));
+        assert!(em.out.contains(">A coordinate system</w:t>"));
+        assert!(em.out.contains("w:pos=\"790\""));
+        assert!(em.out.contains("w:pos=\"580\""));
+    }
+
+    #[test]
+    fn explicit_vertical_spacing_is_preserved() {
+        let spacer = HtmlElement::new(tag::div)
+            .with_attr(attr::class, "typst-vspace")
+            .with_attr(attr::style, "height: 12pt");
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.block_el(&spacer);
+
+        assert!(em.out.contains("<w:spacing w:before=\"240\" w:after=\"0\""));
+        assert!(em.out.contains("w:line=\"1\" w:lineRule=\"exact\""));
+    }
+
+    #[test]
+    fn heading_typography_skips_earlier_duplicate_card_text() {
+        let layout_runs = [
+            layout::Run {
+                text: "Editorial systems".into(),
+                family: "Calibri".into(),
+                size_pt: 10.0,
+                bold: true,
+                italic: false,
+                color: "000000".into(),
+                span: None,
+                x_pt: 0.0,
+                width_pt: 80.0,
+                y_pt: 0.0,
+                page: 1,
+                region: layout::PageRegion::Body,
+                ascent_pt: 8.0,
+                descent_pt: 2.0,
+            },
+            layout::Run {
+                text: "Editorial systems".into(),
+                family: "Calibri".into(),
+                size_pt: 17.0,
+                bold: true,
+                italic: false,
+                color: "123B5D".into(),
+                span: None,
+                x_pt: 0.0,
+                width_pt: 130.0,
+                y_pt: 100.0,
+                page: 2,
+                region: layout::PageRegion::Body,
+                ascent_pt: 13.0,
+                descent_pt: 4.0,
+            },
+        ];
+        let mut em = Emitter::new(&layout_runs, 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        let semantic = [Run {
+            text: "Editorial systems".into(),
+            math_xml: None,
+            bold: false,
+            italic: false,
+            mono: false,
+            br: false,
+            href: None,
+            footnote_ref: None,
+            strike: false,
+            highlight: false,
+        }];
+
+        assert_eq!(em.measure_runs(&semantic, true)[0].as_ref().unwrap().size_pt, 17.0);
+    }
+
+    #[test]
+    fn caption_matching_does_not_fall_back_to_one_letter_code_run() {
+        let layout_runs = [
+            layout::Run {
+                text: "a".into(),
+                family: "DejaVu Sans Mono".into(),
+                size_pt: 8.5,
+                bold: false,
+                italic: false,
+                color: "000000".into(),
+                span: None,
+                x_pt: 0.0,
+                width_pt: 5.0,
+                y_pt: 700.0,
+                page: 4,
+                region: layout::PageRegion::Body,
+                ascent_pt: 7.0,
+                descent_pt: 2.0,
+            },
+            layout::Run {
+                text: "A wide chart image used as a stable visual anchor.".into(),
+                family: "Calibri".into(),
+                size_pt: 10.0,
+                bold: false,
+                italic: false,
+                color: "000000".into(),
+                span: None,
+                x_pt: 0.0,
+                width_pt: 220.0,
+                y_pt: 520.0,
+                page: 4,
+                region: layout::PageRegion::Body,
+                ascent_pt: 8.0,
+                descent_pt: 2.0,
+            },
+        ];
+        let semantic = [Run {
+            text: "A wide chart image used as a stable visual anchor.".into(),
+            math_xml: None,
+            bold: false,
+            italic: false,
+            mono: false,
+            br: false,
+            href: None,
+            footnote_ref: None,
+            strike: false,
+            highlight: false,
+        }];
+        let mut em = Emitter::new(&layout_runs, 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+
+        let measured = em.measure_runs(&semantic, false);
+        let matched = measured[0].as_ref().unwrap();
+        assert_eq!(matched.family, "Calibri");
+        assert_eq!(matched.size_pt, 10.0);
+    }
+
+    #[test]
+    fn prose_punctuation_does_not_inherit_code_font() {
+        let layout_runs = [layout::Run {
+            text: ":".into(),
+            family: "DejaVu Sans Mono".into(),
+            size_pt: 8.5,
+            bold: false,
+            italic: false,
+            color: "000000".into(),
+            span: None,
+            x_pt: 0.0,
+            width_pt: 3.0,
+            y_pt: 700.0,
+            page: 4,
+            region: layout::PageRegion::Body,
+            ascent_pt: 7.0,
+            descent_pt: 2.0,
+        }];
+        let semantic = [Run {
+            text: ":".into(),
+            math_xml: None,
+            bold: false,
+            italic: false,
+            mono: false,
+            br: false,
+            href: None,
+            footnote_ref: None,
+            strike: false,
+            highlight: false,
+        }];
+        let mut em = Emitter::new(&layout_runs, 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        let measured = em.measure_runs(&semantic, false);
+        assert!(measured[0].is_none());
+        em.run(&semantic[0], measured[0].as_ref(), false);
+        assert!(!em.out.contains("DejaVu Sans Mono"));
+    }
+
+    #[test]
+    fn equation_numbers_use_dynamic_sequence_fields() {
+        let first = HtmlElement::new(tag::mathml::math)
+            .with_attr(attr::data_typst_equation_number, "(1)");
+        let second = HtmlElement::new(tag::mathml::math)
+            .with_attr(attr::data_typst_equation_number, "(2)");
+        let mut em = Emitter::new(&[], 450.0, false, false, Vec::new(), Vec::new(), 0, 0);
+        em.display_equation(&first);
+        em.display_equation(&second);
+
+        assert!(em.out.contains("SEQ Equation \\* ARABIC"));
+        assert_eq!(em.out.matches("<w:fldSimple w:instr=\" SEQ Equation").count(), 2);
+        assert!(em.out.contains("<w:t>1</w:t>"));
+        assert!(em.out.contains("<w:t>2</w:t>"));
+    }
+
 }

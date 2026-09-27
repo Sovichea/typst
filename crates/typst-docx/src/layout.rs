@@ -9,11 +9,12 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use typst_library::layout::{Frame, FrameItem, Point};
+use typst_layout::{Page, PagedDocument};
+use typst_library::layout::{Frame, FrameItem, Point, Size, Transform};
 use typst_library::text::{FontStyle, TextItem};
 use typst_library::visualize::{Geometry, Paint};
 use typst_library::{World, WorldExt};
-use typst_layout::{Page, PagedDocument};
+use typst_syntax::Span;
 
 /// Which part of the page a run belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +102,8 @@ pub fn collect_runs(document: &PagedDocument) -> Vec<Run> {
 /// An image placed in the layout.
 #[derive(Clone, Debug)]
 pub struct ImageInfo {
+    /// The Typst image expression that produced this placed image.
+    pub span: Span,
     /// The image's left edge, in points.
     pub x_pt: f64,
     /// The image's top edge, in points.
@@ -123,14 +126,29 @@ pub fn collect_images(document: &PagedDocument) -> Vec<ImageInfo> {
         let top = page.margin.top.to_pt();
         let bottom = page.margin.bottom.to_pt();
 
-        walk_items(&page.frame, Point::zero(), &mut |item, at| {
-            let FrameItem::Image(_, size, _) = item else { return };
-            let y_pt = at.y.to_pt();
+        walk_images(&page.frame, Transform::identity(), &mut |size, span, transform| {
+            let corners = [
+                (0.0, 0.0),
+                (size.x.to_pt(), 0.0),
+                (0.0, size.y.to_pt()),
+                (size.x.to_pt(), size.y.to_pt()),
+            ];
+            let xs = corners.map(|(x, y)| {
+                transform.tx.to_pt() + transform.sx.get() * x + transform.kx.get() * y
+            });
+            let ys = corners.map(|(x, y)| {
+                transform.ty.to_pt() + transform.ky.get() * x + transform.sy.get() * y
+            });
+            let x_pt = xs.into_iter().fold(f64::INFINITY, f64::min);
+            let right = xs.into_iter().fold(f64::NEG_INFINITY, f64::max);
+            let y_pt = ys.into_iter().fold(f64::INFINITY, f64::min);
+            let bottom_edge = ys.into_iter().fold(f64::NEG_INFINITY, f64::max);
             images.push(ImageInfo {
-                x_pt: at.x.to_pt(),
+                span,
+                x_pt,
                 y_pt,
-                width_pt: size.x.to_pt(),
-                height_pt: size.y.to_pt(),
+                width_pt: right - x_pt,
+                height_pt: bottom_edge - y_pt,
                 page: index as u64 + 1,
                 region: if y_pt < top {
                     PageRegion::Header
@@ -143,6 +161,35 @@ pub fn collect_images(document: &PagedDocument) -> Vec<ImageInfo> {
         });
     }
     images
+}
+
+/// Find images in the paged frame, applying group translations and transforms.
+fn walk_images(
+    frame: &Frame,
+    transform: Transform,
+    f: &mut dyn FnMut(Size, Span, Transform),
+) {
+    for (pos, item) in frame.items() {
+        let at = transform.pre_concat(Transform::translate(pos.x, pos.y));
+        match item {
+            FrameItem::Image(_, size, span) => f(*size, *span, at),
+            FrameItem::Group(group) => {
+                walk_images(&group.frame, at.pre_concat(group.transform), f)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The first image inside an evaluated frame, used to locate a composed float.
+pub fn first_image_span(frame: &Frame) -> Option<Span> {
+    let mut found = None;
+    walk_images(frame, Transform::identity(), &mut |_, span, _| {
+        if found.is_none() {
+            found = Some(span);
+        }
+    });
+    found
 }
 
 /// A horizontal rule (a stroked line) measured from the layout.
